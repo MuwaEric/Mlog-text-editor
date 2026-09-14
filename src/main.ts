@@ -40,15 +40,6 @@ interface Prefs {
   windowLines: number;
 }
 
-const MIN_VIEWPORT_WINDOW_LINES = 500;
-const MAX_VIEWPORT_WINDOW_LINES = 20000;
-
-const clampViewportWindowLines = (value: number) =>
-  Math.min(
-    Math.max(Math.round(value), MIN_VIEWPORT_WINDOW_LINES),
-    MAX_VIEWPORT_WINDOW_LINES
-  );
-
 const DEFAULT_PREFS: Prefs = {
   theme: "vs",
   fontSize: 14,
@@ -71,8 +62,8 @@ const PREFS_KEY = "gfe.prefs";
 let prefs: Prefs = { ...DEFAULT_PREFS };
 let defaultFontFamily = "";
 
-const windowLines = () => clampViewportWindowLines(prefs.windowLines);
-const reanchorMargin = () => Math.max(50, Math.floor(windowLines() / 5));
+const windowLines = () => prefs.windowLines;
+const reanchorMargin = () => Math.max(50, Math.floor(prefs.windowLines / 5));
 
 function loadPrefs() {
   try {
@@ -83,7 +74,7 @@ function loadPrefs() {
   } catch {
     prefs = { ...DEFAULT_PREFS };
   }
-  prefs.windowLines = clampViewportWindowLines(prefs.windowLines);
+  prefs.windowLines = Math.min(Math.max(prefs.windowLines, 500), 20000);
   prefs.fontSize = Math.min(Math.max(prefs.fontSize, 8), 40);
   prefs.tabSize = Math.min(Math.max(prefs.tabSize, 1), 16);
 }
@@ -407,30 +398,23 @@ function updateHitControls() {
   if (next) next.disabled = hits.length === 0;
 }
 
-/** Centres the given match in the viewport and selects the precise match range. */
+/** Centres the given match in the viewport and selects it. Wraps around at either end. */
 async function gotoHit(index: number) {
   if (!hits.length) return;
   hitIndex = ((index % hits.length) + hits.length) % hits.length;
   const hit = hits[hitIndex];
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const startLine = toModelLine(hit.line);
-    const endLine = toModelLine(hit.end_line);
-    if (startLine >= 1 && endLine <= windowCount) {
-      const range = new monaco.Range(startLine, hit.column, endLine, hit.end_column);
-      syncing = true;
-      editor.setSelection(range);
-      editor.revealRangeInCenter(range, monaco.editor.ScrollType.Smooth);
-      syncing = false;
-      updateHitControls();
-      return;
-    }
-    await goToLine(Math.max(1, hit.line - Math.floor(linesPerScreen() / 2)));
-  }
+  await goToLine(hit.line - Math.floor(linesPerScreen() / 2));
 
-  // Final fallback: make sure the target line is visible even if the hit is not in the current
-  // window, then leave the caret near the match without forcing a stale range into the model.
-  await goToLine(Math.max(1, hit.line));
+  const startLine = toModelLine(hit.line);
+  const endLine = toModelLine(hit.end_line);
+  if (startLine >= 1 && endLine <= windowCount) {
+    syncing = true;
+    editor.setSelection(
+      new monaco.Range(startLine, hit.column, endLine, hit.end_column)
+    );
+    syncing = false;
+  }
   updateHitControls();
 }
 
@@ -474,9 +458,8 @@ function syncPrefControls() {
 
 /** Applies a preference change everywhere and persists it. */
 async function updatePref<K extends keyof Prefs>(key: K, value: Prefs[K]) {
-  const rawValue = key === "windowLines" ? clampViewportWindowLines(Number(value)) : value;
-  const windowChanged = key === "windowLines" && rawValue !== prefs.windowLines;
-  prefs[key] = rawValue as Prefs[K];
+  const windowChanged = key === "windowLines" && value !== prefs.windowLines;
+  prefs[key] = value;
   savePrefs();
   applyPrefs();
   syncPrefControls();
@@ -548,12 +531,7 @@ function wirePreferences() {
 
   bindNumber("#pref-font-size", "fontSize", 8, 40);
   bindNumber("#pref-tab-size", "tabSize", 1, 16);
-  bindNumber(
-    "#pref-window-lines",
-    "windowLines",
-    MIN_VIEWPORT_WINDOW_LINES,
-    MAX_VIEWPORT_WINDOW_LINES
-  );
+  bindNumber("#pref-window-lines", "windowLines", 500, 20000);
 
   document.querySelector("#pref-theme")?.addEventListener("change", (e) => {
     void updatePref(
