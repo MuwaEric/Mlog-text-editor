@@ -409,10 +409,15 @@ async function gotoHit(index: number) {
   const startLine = toModelLine(hit.line);
   const endLine = toModelLine(hit.end_line);
   if (startLine >= 1 && endLine <= windowCount) {
-    syncing = true;
-    editor.setSelection(
-      new monaco.Range(startLine, hit.column, endLine, hit.end_column)
+    const range = new monaco.Range(
+      startLine,
+      hit.column,
+      endLine,
+      hit.end_column
     );
+    syncing = true;
+    editor.setSelection(range);
+    editor.revealRangeInCenter(range, monaco.editor.ScrollType.Immediate);
     syncing = false;
   }
   updateHitControls();
@@ -560,6 +565,20 @@ window.addEventListener("DOMContentLoaded", () => {
   const container = document.querySelector<HTMLDivElement>("#editor-container");
   if (!container) return;
 
+  const chooseFile = () => {
+    void (async () => {
+      setStatus("Choose a file…");
+      const selected = await openFileDialog({
+        multiple: false,
+        directory: false,
+        title: "Open a text file",
+      });
+      if (typeof selected === "string") await openFile(selected);
+    })().catch((err) => setStatus(`Open failed: ${err}`));
+  };
+  document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
+  wirePreferences();
+
   loadPrefs();
 
   editor = monaco.editor.create(container, {
@@ -590,7 +609,6 @@ window.addEventListener("DOMContentLoaded", () => {
 
   wireEditEvents();
   wireScrollbar();
-  wirePreferences();
 
   void listen<{ bytes_scanned: number; total_bytes: number }>(
     "scan-progress",
@@ -602,17 +620,6 @@ window.addEventListener("DOMContentLoaded", () => {
       setStatus(`Scanning line offsets… ${pct}%`);
     }
   );
-
-  document.querySelector("#open-btn")?.addEventListener("click", () => {
-    void (async () => {
-      const selected = await openFileDialog({
-        multiple: false,
-        directory: false,
-        title: "Open a text file",
-      });
-      if (typeof selected === "string") await openFile(selected);
-    })().catch((err) => setStatus(`Open failed: ${err}`));
-  });
 
   const searchInput =
     document.querySelector<HTMLInputElement>("#search-input");
