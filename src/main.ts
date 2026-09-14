@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import * as monaco from "monaco-editor";
 import editorWorker from "monaco-editor/editor/editor.worker.js?worker";
 
@@ -158,6 +158,8 @@ let searchRequestId = 0;
 let activeSearchRequestId: number | null = null;
 let streamedNavigationRequestId: number | null = null;
 let positionRequestId = 0;
+let currentPath: string | null = null;
+let dirty = false;
 
 const toFileLine = (modelLine: number) => windowStart + modelLine - 1;
 const toModelLine = (fileLine: number) => fileLine - windowStart + 1;
@@ -197,6 +199,57 @@ function updateSearchDecorations() {
 function setStatus(message: string) {
   const el = document.querySelector<HTMLElement>("#status");
   if (el) el.textContent = message;
+}
+
+function updateDocumentState() {
+  const save = document.querySelector<HTMLButtonElement>("#save-btn");
+  const name = document.querySelector<HTMLElement>("#file-name");
+  if (save) save.disabled = !currentPath || !dirty;
+  if (name && currentPath) name.textContent = `${currentPath.split("/").pop() ?? currentPath}${dirty ? " *" : ""}`;
+}
+
+function updateHistoryControls() {
+  const model = editor?.getModel();
+  const undo = document.querySelector<HTMLButtonElement>("#undo-btn");
+  const redo = document.querySelector<HTMLButtonElement>("#redo-btn");
+  if (undo) undo.disabled = !model?.canUndo();
+  if (redo) redo.disabled = !model?.canRedo();
+}
+
+async function saveDocument(path: string | null = currentPath) {
+  if (!path) {
+    const selected = await saveFileDialog({ title: "Save text file" });
+    if (typeof selected !== "string") return;
+    path = selected;
+  }
+  setStatus("Saving…");
+  const meta = await invoke<FileMeta>("save_file", { path });
+  currentPath = path;
+  dirty = false;
+  try { localStorage.removeItem("gfe.recovery"); } catch {}
+  updateDocumentState();
+  setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes saved`);
+}
+
+async function goToPosition() {
+  const value = window.prompt("Enter a line, line:column, or byte offset (prefix byte:):");
+  if (!value) return;
+  if (value.startsWith("byte:")) {
+    const offset = Number(value.slice(5).trim());
+    if (!Number.isSafeInteger(offset) || offset < 0) return setStatus("Invalid byte offset");
+    const [line, column] = await invoke<[number, number]>("position_at_byte", { offset });
+    await goToLine(line);
+    editor.setPosition({ lineNumber: toModelLine(line), column });
+    return;
+  }
+  const parts = value.split(":").map(Number);
+  const line = parts[0];
+  const column = parts.length > 1 ? parts[1] : 1;
+  if (!Number.isSafeInteger(line) || line < 1 || !Number.isSafeInteger(column) || column < 1) {
+    return setStatus("Invalid line or column");
+  }
+  await goToLine(line);
+  editor.setPosition({ lineNumber: toModelLine(line), column });
 }
 
 function updatePosition(modelLine: number, column: number) {
@@ -374,6 +427,9 @@ async function openFile(path: string) {
 
   const nameEl = document.querySelector<HTMLElement>("#file-name");
   if (nameEl) nameEl.textContent = path.split("/").pop() ?? path;
+  currentPath = path;
+  dirty = false;
+  updateDocumentState();
 
   hits = [];
   hitIndex = -1;
@@ -425,6 +481,10 @@ function wireEditEvents() {
     const model = editor.getModel();
     if (model) windowCount = model.getLineCount();
     updateScrollbar();
+    dirty = true;
+    updateDocumentState();
+    updateHistoryControls();
+    try { localStorage.setItem("gfe.recovery", JSON.stringify({ path: currentPath, dirty: true })); } catch {}
   });
 }
 
@@ -666,6 +726,18 @@ window.addEventListener("DOMContentLoaded", () => {
   };
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
   wirePreferences();
+  const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
+  actionsMenu?.addEventListener("click", (event) => {
+    if ((event.target as HTMLElement).closest("button")) actionsMenu.open = false;
+  });
+  window.addEventListener("pointerdown", (event) => {
+    if (actionsMenu?.open && !actionsMenu.contains(event.target as Node)) {
+      actionsMenu.open = false;
+    }
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") actionsMenu && (actionsMenu.open = false);
+  });
 
   loadPrefs();
 
@@ -678,6 +750,7 @@ window.addEventListener("DOMContentLoaded", () => {
     // Everything loads as plaintext, so Monaco's "tokenization skipped on long lines" and
     // "rendering paused" hovers warn about work this app never does.
     hover: { showLongLineWarning: false },
+    maxTokenizationLineLength: 10000,
   });
 
   // Captured before any preference is applied, so "default" font can be restored later.
@@ -700,6 +773,34 @@ window.addEventListener("DOMContentLoaded", () => {
 
   wireEditEvents();
   wireScrollbar();
+  updateHistoryControls();
+
+  document.querySelector("#save-btn")?.addEventListener("click", () => {
+    void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
+  });
+  document.querySelector("#save-as-btn")?.addEventListener("click", () => {
+    void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
+  });
+  document.querySelector("#goto-btn")?.addEventListener("click", () => {
+    void goToPosition().catch((error) => setStatus(`Navigation failed: ${error}`));
+  });
+  document.querySelector("#undo-btn")?.addEventListener("click", () => editor.trigger("ui", "undo", null));
+  document.querySelector("#redo-btn")?.addEventListener("click", () => editor.trigger("ui", "redo", null));
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+    void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
+  });
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, chooseFile);
+  editor.addCommand(
+    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS,
+    () => {
+      void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
+    }
+  );
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyG, () => {
+    void goToPosition().catch((error) => setStatus(`Navigation failed: ${error}`));
+  });
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => editor.trigger("ui", "undo", null));
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => editor.trigger("ui", "redo", null));
 
   void listen<{ bytes_scanned: number; total_bytes: number }>(
     "scan-progress",

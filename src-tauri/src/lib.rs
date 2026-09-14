@@ -8,7 +8,9 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::bytes::RegexBuilder;
 use serde::Serialize;
-use std::fs::File;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::{Emitter, State};
@@ -596,7 +598,10 @@ fn search_document_with_progress(
 const MAX_REPORTED_HITS: usize = 5_000;
 
 #[derive(Default)]
-struct AppState(Arc<Mutex<Option<PieceTable>>>);
+struct AppState {
+    table: Arc<Mutex<Option<PieceTable>>>,
+    path: Arc<Mutex<Option<PathBuf>>>,
+}
 
 #[derive(Serialize, Clone)]
 struct FileMeta {
@@ -644,7 +649,7 @@ where
     T: Send + 'static,
     F: FnOnce(&mut PieceTable) -> T + Send + 'static,
 {
-    let inner = state.0.clone();
+    let inner = state.table.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut guard = inner.lock().map_err(|e| e.to_string())?;
         let table = guard.as_mut().ok_or("no file open")?;
@@ -662,7 +667,8 @@ async fn open_file(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<FileMeta, String> {
-    let inner = state.0.clone();
+    let inner = state.table.clone();
+    let open_path = path.clone();
 
     let table = tauri::async_runtime::spawn_blocking(move || -> Result<PieceTable, String> {
         let file = File::open(&path).map_err(|e| e.to_string())?;
@@ -690,6 +696,49 @@ async fn open_file(
         size_bytes: table.total_length(),
     };
     *inner.lock().map_err(|e| e.to_string())? = Some(table);
+    *state.path.lock().map_err(|e| e.to_string())? = Some(PathBuf::from(open_path));
+    Ok(meta)
+}
+
+/// Streams the logical piece table to disk through a temporary sibling file, then replaces the target.
+#[tauri::command]
+async fn save_file(
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<FileMeta, String> {
+    let target = match path {
+        Some(path) => PathBuf::from(path),
+        None => state
+            .path
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or("no file path selected")?,
+    };
+    let inner = state.table.clone();
+    let meta = tauri::async_runtime::spawn_blocking({
+        let target = target.clone();
+        move || {
+            let guard = inner.lock().map_err(|e| e.to_string())?;
+            let table = guard.as_ref().ok_or("no file open")?;
+            let mut temporary = target.clone();
+            temporary.set_extension(format!("gfe-tmp-{}", std::process::id()));
+            let result = (|| -> Result<FileMeta, String> {
+                let mut output = File::create(&temporary).map_err(|e| e.to_string())?;
+                for piece in &table.pieces {
+                    output.write_all(table.piece_bytes(piece)).map_err(|e| e.to_string())?;
+                }
+                output.sync_all().map_err(|e| e.to_string())?;
+                fs::rename(&temporary, &target).map_err(|e| e.to_string())?;
+                Ok(FileMeta { total_lines: table.total_lines(), size_bytes: table.total_length() })
+            })();
+            if result.is_err() { let _ = fs::remove_file(&temporary); }
+            result
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *state.path.lock().map_err(|e| e.to_string())? = Some(target);
     Ok(meta)
 }
 
@@ -750,6 +799,15 @@ async fn byte_offset(
     column: usize,
 ) -> Result<usize, String> {
     with_table(&state, move |table| table.offset_of_position(line, column))
+        .await
+}
+
+#[tauri::command]
+async fn position_at_byte(
+    state: State<'_, AppState>,
+    offset: usize,
+) -> Result<(usize, usize), String> {
+    with_table(&state, move |table| table.position_of_offset(offset.min(table.total_length())))
         .await
 }
 
@@ -841,10 +899,12 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             open_file,
+            save_file,
             get_lines,
             insert_text,
             delete_text,
             byte_offset,
+            position_at_byte,
             search_text,
             startup_path
         ])

@@ -87,10 +87,98 @@ body {
   background: #3d3d3d;
 }
 
+#actions-menu {
+  position: relative;
+  flex: none;
+}
+
+#actions-menu summary {
+  width: 2em;
+  padding: 0.3em 0;
+  border: 1px solid #ffffff26;
+  border-radius: 4px;
+  background: #333;
+  color: #eee;
+  cursor: pointer;
+  list-style: none;
+  text-align: center;
+}
+
+#actions-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+#actions-menu[open] summary,
+#actions-menu summary:hover {
+  background: #3d3d3d;
+}
+
+.actions-list {
+  position: absolute;
+  top: calc(100% + 0.35em);
+  left: 0;
+  z-index: 20;
+  display: flex;
+  min-width: 18em;
+  flex-direction: column;
+  gap: 0.1em;
+  padding: 0.45em;
+  border: 1px solid #ffffff26;
+  border-radius: 8px;
+  background: #292929;
+  box-shadow: 0 8px 24px #00000080;
+}
+
+.actions-list .menu-item {
+  display: grid;
+  grid-template-columns: 1.5em minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.65em;
+  width: 100%;
+  min-height: 2.1em;
+  padding: 0.35em 0.55em;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+  color: #f3f3f3;
+  font-size: 0.9em;
+  font-weight: 400;
+  text-align: left;
+}
+
+.actions-list .menu-item:hover:not(:disabled) {
+  background: #ffffff1a;
+}
+
+.actions-list .menu-item:disabled {
+  color: #ffffff55;
+  cursor: default;
+}
+
+.menu-icon {
+  color: #d8d8d8;
+  font-size: 1.1em;
+  text-align: center;
+}
+
+.menu-shortcut {
+  color: #ffffff80;
+  font-size: 0.85em;
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 0.35em 0.45em;
+  background: #ffffff1c;
+}
+
 #file-name {
   flex: 1 1 auto;
   font-size: 0.85em;
+  font-weight: 600;
   opacity: 0.9;
+  text-align: center;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

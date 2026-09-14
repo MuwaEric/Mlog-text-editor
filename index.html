@@ -10,14 +10,41 @@
 
   <body>
     <div id="toolbar">
-      <button id="open-btn" type="button">Open File…</button>
-      <span id="file-name">No file open</span>
+      <details id="actions-menu">
+        <summary title="Application menu">☰</summary>
+        <div class="actions-list">
+          <button id="open-btn" class="menu-item" type="button" title="Open File (Ctrl+O)">
+            <span class="menu-icon">↗</span><span>Open File…</span><span class="menu-shortcut">Ctrl+O</span>
+          </button>
+          <div class="menu-separator"></div>
+          <button id="save-btn" class="menu-item" type="button" disabled title="Save (Ctrl+S)">
+            <span class="menu-icon">↓</span><span>Save</span><span class="menu-shortcut">Ctrl+S</span>
+          </button>
+          <button id="save-as-btn" class="menu-item" type="button" title="Save As (Ctrl+Shift+S)">
+            <span class="menu-icon">⇩</span><span>Save As…</span><span class="menu-shortcut">Ctrl+Shift+S</span>
+          </button>
+          <div class="menu-separator"></div>
+          <button id="undo-btn" class="menu-item" type="button" disabled title="Undo (Ctrl+Z)">
+            <span class="menu-icon">↶</span><span>Undo</span><span class="menu-shortcut">Ctrl+Z</span>
+          </button>
+          <button id="redo-btn" class="menu-item" type="button" disabled title="Redo (Ctrl+Y)">
+            <span class="menu-icon">↷</span><span>Redo</span><span class="menu-shortcut">Ctrl+Y</span>
+          </button>
+          <button id="goto-btn" class="menu-item" type="button" title="Go To line or byte (Ctrl+G)">
+            <span class="menu-icon">⌖</span><span>Go To…</span><span class="menu-shortcut">Ctrl+G</span>
+          </button>
+          <div class="menu-separator"></div>
+          <button id="prefs-btn" class="menu-item" type="button" title="Preferences">
+            <span class="menu-icon">⚙</span><span>Preferences…</span><span class="menu-shortcut"></span>
+          </button>
+        </div>
+      </details>
+      <span id="file-name" title="Current document">No file open</span>
       <label class="switch">
         <input type="checkbox" id="word-wrap" />
         <span class="switch-track"><span class="switch-knob"></span></span>
         <span class="switch-text">Wrap</span>
       </label>
-      <button id="prefs-btn" title="Preferences">⚙</button>
     </div>
     <div id="editor-wrap">
       <div id="editor-container"></div>
