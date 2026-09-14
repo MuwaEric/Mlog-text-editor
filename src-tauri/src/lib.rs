@@ -499,12 +499,15 @@ struct FileMeta {
     size_bytes: usize,
 }
 
-/// 1-based line and UTF-16 column, i.e. directly usable as a Monaco `IPosition`.
+/// 1-based line and UTF-16 column, i.e. directly usable as a Monaco `IPosition`. The end pair
+/// is the position just past the match, so the two form a selectable range.
 #[derive(Serialize, Clone)]
 struct SearchHit {
     byte_offset: usize,
     line: usize,
     column: usize,
+    end_line: usize,
+    end_column: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -646,10 +649,14 @@ async fn search_text(
             .take(MAX_REPORTED_HITS)
             .map(|&byte_offset| {
                 let (line, column) = table.position_of_offset(byte_offset);
+                let (end_line, end_column) =
+                    table.position_of_offset(byte_offset + pattern.len());
                 SearchHit {
                     byte_offset,
                     line,
                     column,
+                    end_line,
+                    end_column,
                 }
             })
             .collect();

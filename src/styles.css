@@ -64,6 +64,33 @@ body {
   user-select: none;
 }
 
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  font-size: 0.85em;
+  white-space: nowrap;
+  user-select: none;
+}
+
+#prev-hit,
+#next-hit {
+  padding: 0.2em 0.5em;
+  line-height: 1;
+}
+
+#prev-hit:disabled,
+#next-hit:disabled {
+  opacity: 0.4;
+}
+
+#hit-counter {
+  font-size: 0.85em;
+  min-width: 4em;
+  opacity: 0.9;
+  white-space: nowrap;
+}
+
 #editor-wrap {
   position: relative;
   height: calc(100vh - 3em);

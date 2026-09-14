@@ -13,11 +13,20 @@
       <button id="open-btn">Open File…</button>
       <span id="file-name">No file open</span>
       <input id="search-input" placeholder="Find in file..." />
-      <label id="match-case-label">
+      <button id="search-btn">Search</button>
+      <button id="prev-hit" title="Previous match (Shift+Enter)" disabled>
+        ▲
+      </button>
+      <button id="next-hit" title="Next match (Enter)" disabled>▼</button>
+      <span id="hit-counter"></span>
+      <label class="toggle">
         <input type="checkbox" id="match-case" />
         Match case
       </label>
-      <button id="search-btn">Search</button>
+      <label class="toggle">
+        <input type="checkbox" id="word-wrap" />
+        Wrap
+      </label>
       <span id="status"></span>
     </div>
     <div id="editor-wrap">

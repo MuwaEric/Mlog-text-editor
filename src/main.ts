@@ -27,6 +27,8 @@ interface SearchHit {
   byte_offset: number;
   line: number;
   column: number;
+  end_line: number;
+  end_column: number;
 }
 
 interface SearchResult {
@@ -44,6 +46,12 @@ let syncing = false; // suppresses scroll/content handling while we re-anchor
 let reanchoring = false;
 let pendingEdits: Promise<unknown> = Promise.resolve();
 
+let hits: SearchHit[] = [];
+let hitIndex = -1;
+let hitsTruncated = false;
+let lastQuery: string | null = null;
+let lastMatchCase = false;
+
 const toFileLine = (modelLine: number) => windowStart + modelLine - 1;
 const toModelLine = (fileLine: number) => fileLine - windowStart + 1;
 
@@ -56,7 +64,19 @@ function lineHeight(): number {
   return editor.getOption(monaco.editor.EditorOption.lineHeight);
 }
 
+/** First and last *model* lines on screen. Reflects wrapping, unlike scrollTop arithmetic. */
+function visibleModelRange(): { start: number; end: number } | null {
+  const ranges = editor.getVisibleRanges();
+  if (!ranges.length) return null;
+  return {
+    start: ranges[0].startLineNumber,
+    end: ranges[ranges.length - 1].endLineNumber,
+  };
+}
+
 function linesPerScreen(): number {
+  const r = visibleModelRange();
+  if (r) return Math.max(1, r.end - r.start + 1);
   return Math.max(1, Math.floor(editor.getLayoutInfo().height / lineHeight()));
 }
 
@@ -89,7 +109,12 @@ async function anchorWindow(start: number) {
 
 function scrollToViewTop() {
   syncing = true;
-  editor.setScrollTop(Math.max(0, (viewTop - windowStart) * lineHeight()));
+  // getTopForLineNumber accounts for wrapped lines; scrollTop/lineHeight would not.
+  const modelLine = Math.min(
+    Math.max(1, toModelLine(viewTop)),
+    Math.max(1, windowCount)
+  );
+  editor.setScrollTop(editor.getTopForLineNumber(modelLine));
   syncing = false;
 }
 
@@ -195,6 +220,11 @@ async function openFile(path: string) {
   const nameEl = document.querySelector<HTMLElement>("#file-name");
   if (nameEl) nameEl.textContent = path.split("/").pop() ?? path;
 
+  hits = [];
+  hitIndex = -1;
+  lastQuery = null;
+  updateHitControls();
+
   await anchorWindow(1);
   scrollToViewTop();
   updateScrollbar();
@@ -250,18 +280,50 @@ async function runSearch(query: string) {
   setStatus("Searching…");
   await pendingEdits;
   const result = await invoke<SearchResult>("search_text", { query, matchCase });
-  const shown = result.truncated ? ` (showing first ${result.hits.length})` : "";
+  const shown = result.truncated ? ` (first ${result.hits.length} navigable)` : "";
   setStatus(`${result.total_matches.toLocaleString()} match(es)${shown}`);
 
-  if (result.hits.length > 0) {
-    const hit = result.hits[0];
-    await goToLine(hit.line - Math.floor(linesPerScreen() / 2));
-    const modelLine = toModelLine(hit.line);
-    if (modelLine >= 1 && modelLine <= windowCount) {
-      editor.setPosition({ lineNumber: modelLine, column: hit.column });
-      editor.focus();
-    }
+  hits = result.hits;
+  hitsTruncated = result.truncated;
+  hitIndex = -1;
+  lastQuery = query;
+  lastMatchCase = matchCase;
+  updateHitControls();
+
+  if (hits.length > 0) await gotoHit(0);
+}
+
+function updateHitControls() {
+  const counter = document.querySelector<HTMLElement>("#hit-counter");
+  const prev = document.querySelector<HTMLButtonElement>("#prev-hit");
+  const next = document.querySelector<HTMLButtonElement>("#next-hit");
+  if (counter) {
+    counter.textContent = hits.length
+      ? `${hitIndex + 1}/${hits.length}${hitsTruncated ? "+" : ""}`
+      : "";
   }
+  if (prev) prev.disabled = hits.length === 0;
+  if (next) next.disabled = hits.length === 0;
+}
+
+/** Centres the given match in the viewport and selects it. Wraps around at either end. */
+async function gotoHit(index: number) {
+  if (!hits.length) return;
+  hitIndex = ((index % hits.length) + hits.length) % hits.length;
+  const hit = hits[hitIndex];
+
+  await goToLine(hit.line - Math.floor(linesPerScreen() / 2));
+
+  const startLine = toModelLine(hit.line);
+  const endLine = toModelLine(hit.end_line);
+  if (startLine >= 1 && endLine <= windowCount) {
+    syncing = true;
+    editor.setSelection(
+      new monaco.Range(startLine, hit.column, endLine, hit.end_column)
+    );
+    syncing = false;
+  }
+  updateHitControls();
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -273,7 +335,6 @@ window.addEventListener("DOMContentLoaded", () => {
     language: "plaintext",
     automaticLayout: true,
     minimap: { enabled: false },
-    // Word wrap would break the 1:1 model-line-to-file-line mapping.
     wordWrap: "off",
     scrollBeyondLastLine: false,
     scrollbar: { vertical: "hidden", verticalScrollbarSize: 0 },
@@ -282,7 +343,9 @@ window.addEventListener("DOMContentLoaded", () => {
 
   editor.onDidScrollChange(() => {
     if (syncing) return;
-    viewTop = windowStart + Math.round(editor.getScrollTop() / lineHeight());
+    const r = visibleModelRange();
+    if (!r) return;
+    viewTop = toFileLine(r.start);
     updateScrollbar();
     void maybeReanchor();
   });
@@ -313,10 +376,49 @@ window.addEventListener("DOMContentLoaded", () => {
     })().catch((err) => setStatus(`Open failed: ${err}`));
   });
 
-  document.querySelector("#search-btn")?.addEventListener("click", () => {
-    const query =
-      document.querySelector<HTMLInputElement>("#search-input")?.value ?? "";
+  const searchInput =
+    document.querySelector<HTMLInputElement>("#search-input");
+  const matchCaseBox =
+    document.querySelector<HTMLInputElement>("#match-case");
+
+  const currentMatchCase = () => matchCaseBox?.checked ?? false;
+  const search = () => {
+    const query = searchInput?.value ?? "";
     void runSearch(query).catch((err) => setStatus(`Search failed: ${err}`));
+  };
+
+  document.querySelector("#search-btn")?.addEventListener("click", search);
+
+  // Enter steps through existing results; it only re-runs the search when the query changed.
+  searchInput?.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const stale =
+      searchInput.value !== lastQuery || currentMatchCase() !== lastMatchCase;
+    if (stale || hits.length === 0) {
+      search();
+    } else {
+      void gotoHit(hitIndex + (e.shiftKey ? -1 : 1));
+    }
+  });
+
+  document
+    .querySelector("#prev-hit")
+    ?.addEventListener("click", () => void gotoHit(hitIndex - 1));
+  document
+    .querySelector("#next-hit")
+    ?.addEventListener("click", () => void gotoHit(hitIndex + 1));
+
+  matchCaseBox?.addEventListener("change", () => {
+    lastQuery = null; // force a fresh search rather than stepping stale results
+  });
+
+  document.querySelector("#word-wrap")?.addEventListener("change", (e) => {
+    const on = (e.target as HTMLInputElement).checked;
+    editor.updateOptions({ wordWrap: on ? "on" : "off" });
+    // Wrapping changes visual line heights, so re-pin the viewport to the same file line.
+    scrollToViewTop();
+    updateScrollbar();
   });
 
   void invoke<string | null>("startup_path")
