@@ -144,6 +144,7 @@ let hitsTruncated = false;
 let lastQuery: string | null = null;
 let lastMatchCase = false;
 let searchDecorationIds: string[] = [];
+let searchRequestId = 0;
 
 const toFileLine = (modelLine: number) => windowStart + modelLine - 1;
 const toModelLine = (fileLine: number) => fileLine - windowStart + 1;
@@ -401,11 +402,14 @@ function wireEditEvents() {
 
 async function runSearch(query: string) {
   if (!query) return;
+  const requestId = ++searchRequestId;
   const matchCase =
     document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
   setStatus("Searching…");
   await pendingEdits;
+  if (requestId !== searchRequestId) return;
   const result = await invoke<SearchResult>("search_text", { query, matchCase });
+  if (requestId !== searchRequestId) return;
   const shown = result.truncated ? ` (first ${result.hits.length} navigable)` : "";
   setStatus(`${result.total_matches.toLocaleString()} match(es)${shown}`);
 
