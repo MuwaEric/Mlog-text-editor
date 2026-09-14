@@ -432,13 +432,35 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec
 ///   * piece boundaries — a small window around each one is re-scanned for matches that
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
 fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
-    search_document_with_progress(table, pattern, fold_case, None, 0)
+    search_document_with_progress(table, pattern, fold_case, false, None, 0)
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_whole_word_match(table: &PieceTable, offset: usize, length: usize) -> bool {
+    let before = if offset > 0 {
+        table.get_bytes_range(offset - 1, offset).first().copied()
+    } else {
+        None
+    };
+    let after = if offset + length < table.total_length() {
+        table
+            .get_bytes_range(offset + length, offset + length + 1)
+            .first()
+            .copied()
+    } else {
+        None
+    };
+    !before.is_some_and(is_word_byte) && !after.is_some_and(is_word_byte)
 }
 
 fn search_document_with_progress(
     table: &PieceTable,
     pattern: &[u8],
     fold_case: bool,
+    whole_word: bool,
     app: Option<&tauri::AppHandle>,
     request_id: u64,
 ) -> Vec<usize> {
@@ -471,6 +493,9 @@ fn search_document_with_progress(
                 .into_iter()
                 .filter(move |&local| s + local < primary_end)
                 .map(move |local| base + local)
+                .filter(|&offset| {
+                    !whole_word || is_whole_word_match(table, offset, pattern.len())
+                })
                 .collect::<Vec<_>>();
             let streamed_hits = local_hits
                 .iter()
@@ -703,6 +728,7 @@ async fn search_text(
     query: String,
     match_case: bool,
     request_id: u64,
+    whole_word: bool,
 ) -> Result<SearchResult, String> {
     with_table(&state, move |table| {
         let pattern = if match_case {
@@ -714,6 +740,7 @@ async fn search_text(
             table,
             &pattern,
             !match_case,
+            whole_word,
             Some(&app),
             request_id,
         );

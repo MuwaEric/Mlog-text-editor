@@ -151,6 +151,7 @@ let hitIndex = -1;
 let hitsTruncated = false;
 let lastQuery: string | null = null;
 let lastMatchCase = false;
+let lastWholeWord = false;
 let searchDecorationIds: string[] = [];
 let searchRequestId = 0;
 let activeSearchRequestId: number | null = null;
@@ -421,6 +422,8 @@ async function runSearch(query: string) {
   updateHitControls();
   const matchCase =
     document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
+  const wholeWord =
+    document.querySelector<HTMLInputElement>("#whole-word")?.checked ?? false;
   setStatus("Searching…");
   await pendingEdits;
   if (requestId !== searchRequestId) return;
@@ -428,6 +431,7 @@ async function runSearch(query: string) {
     query,
     matchCase,
     requestId,
+    wholeWord,
   });
   if (requestId !== searchRequestId) return;
   activeSearchRequestId = null;
@@ -439,6 +443,7 @@ async function runSearch(query: string) {
   hitIndex = -1;
   lastQuery = query;
   lastMatchCase = matchCase;
+  lastWholeWord = wholeWord;
   updateSearchDecorations();
   updateHitControls();
 
@@ -709,6 +714,8 @@ window.addEventListener("DOMContentLoaded", () => {
     document.querySelector<HTMLInputElement>("#search-input");
   const matchCaseBox =
     document.querySelector<HTMLInputElement>("#match-case");
+  const wholeWordBox =
+    document.querySelector<HTMLInputElement>("#whole-word");
 
   const currentMatchCase = () => matchCaseBox?.checked ?? false;
   const search = () => {
@@ -743,7 +750,9 @@ window.addEventListener("DOMContentLoaded", () => {
     if (e.key !== "Enter") return;
     e.preventDefault();
     const stale =
-      searchInput.value !== lastQuery || currentMatchCase() !== lastMatchCase;
+      searchInput.value !== lastQuery ||
+      currentMatchCase() !== lastMatchCase ||
+      (wholeWordBox?.checked ?? false) !== lastWholeWord;
     if (stale || hits.length === 0) {
       search();
     } else {
@@ -761,6 +770,9 @@ window.addEventListener("DOMContentLoaded", () => {
   matchCaseBox?.addEventListener("change", () => {
     lastQuery = null; // force a fresh search rather than stepping stale results
     void updatePref("matchCase", currentMatchCase());
+  });
+  wholeWordBox?.addEventListener("change", () => {
+    lastQuery = null;
   });
 
   void invoke<string | null>("startup_path")
