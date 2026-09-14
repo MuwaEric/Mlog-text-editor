@@ -15,8 +15,68 @@ self.MonacoEnvironment = { getWorker: () => new editorWorker() };
 // Consequences of windowing: Monaco's own scrollbar would only describe the window, so it is
 // hidden and replaced by a custom one spanning the file; and model line N is file line
 // windowStart + N - 1, so every position crossing the IPC boundary must be translated.
-const WINDOW_LINES = 4000;
-const REANCHOR_MARGIN = 800;
+
+interface Prefs {
+  theme: "vs" | "vs-dark" | "hc-black";
+  fontSize: number;
+  wordWrap: boolean;
+  lineNumbers: boolean;
+  minimap: boolean;
+  renderWhitespace: boolean;
+  matchCase: boolean;
+  windowLines: number;
+}
+
+const DEFAULT_PREFS: Prefs = {
+  theme: "vs",
+  fontSize: 14,
+  wordWrap: false,
+  lineNumbers: true,
+  minimap: false,
+  renderWhitespace: false,
+  matchCase: false,
+  windowLines: 4000,
+};
+
+const PREFS_KEY = "gfe.prefs";
+let prefs: Prefs = { ...DEFAULT_PREFS };
+
+const windowLines = () => prefs.windowLines;
+const reanchorMargin = () => Math.max(50, Math.floor(prefs.windowLines / 5));
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    prefs = raw
+      ? { ...DEFAULT_PREFS, ...(JSON.parse(raw) as Partial<Prefs>) }
+      : { ...DEFAULT_PREFS };
+  } catch {
+    prefs = { ...DEFAULT_PREFS };
+  }
+  prefs.windowLines = Math.min(Math.max(prefs.windowLines, 500), 20000);
+  prefs.fontSize = Math.min(Math.max(prefs.fontSize, 8), 40);
+}
+
+function savePrefs() {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    setStatus("Preferences could not be saved");
+  }
+}
+
+function applyPrefs() {
+  monaco.editor.setTheme(prefs.theme);
+  editor.updateOptions({
+    fontSize: prefs.fontSize,
+    wordWrap: prefs.wordWrap ? "on" : "off",
+    lineNumbers: prefs.lineNumbers
+      ? (modelLine) => String(toFileLine(modelLine))
+      : "off",
+    minimap: { enabled: prefs.minimap },
+    renderWhitespace: prefs.renderWhitespace ? "all" : "none",
+  });
+}
 
 interface FileMeta {
   total_lines: number;
@@ -86,9 +146,9 @@ function maxViewTop(): number {
 
 /** Loads a fresh window of lines into the model, starting at `start`. */
 async function anchorWindow(start: number) {
-  const maxStart = Math.max(1, totalLines - WINDOW_LINES + 1);
+  const maxStart = Math.max(1, totalLines - windowLines() + 1);
   const newStart = Math.min(Math.max(1, Math.round(start)), maxStart);
-  const end = Math.min(newStart + WINDOW_LINES - 1, totalLines);
+  const end = Math.min(newStart + windowLines() - 1, totalLines);
 
   await pendingEdits; // never read lines the backend has not applied edits to yet
   const raw = await invoke<string>("get_lines", {
@@ -124,12 +184,12 @@ async function goToLine(fileLine: number) {
   const visible = linesPerScreen();
   const needsWindow =
     windowCount === 0 ||
-    (windowStart > 1 && viewTop < windowStart + REANCHOR_MARGIN) ||
+    (windowStart > 1 && viewTop < windowStart + reanchorMargin()) ||
     (windowStart + windowCount - 1 < totalLines &&
-      viewTop + visible > windowStart + windowCount - REANCHOR_MARGIN);
+      viewTop + visible > windowStart + windowCount - reanchorMargin());
 
   if (needsWindow) {
-    await anchorWindow(viewTop - Math.floor((WINDOW_LINES - visible) / 2));
+    await anchorWindow(viewTop - Math.floor((windowLines() - visible) / 2));
   }
   scrollToViewTop();
   updateScrollbar();
@@ -139,15 +199,15 @@ async function goToLine(fileLine: number) {
 async function maybeReanchor() {
   if (reanchoring) return;
   const visible = linesPerScreen();
-  const nearTop = windowStart > 1 && viewTop < windowStart + REANCHOR_MARGIN;
+  const nearTop = windowStart > 1 && viewTop < windowStart + reanchorMargin();
   const nearBottom =
     windowStart + windowCount - 1 < totalLines &&
-    viewTop + visible > windowStart + windowCount - REANCHOR_MARGIN;
+    viewTop + visible > windowStart + windowCount - reanchorMargin();
   if (!nearTop && !nearBottom) return;
 
   reanchoring = true;
   try {
-    await anchorWindow(viewTop - Math.floor((WINDOW_LINES - visible) / 2));
+    await anchorWindow(viewTop - Math.floor((windowLines() - visible) / 2));
     scrollToViewTop();
     updateScrollbar();
   } finally {
@@ -326,23 +386,132 @@ async function gotoHit(index: number) {
   updateHitControls();
 }
 
+/** Keys whose value is a boolean, so checkbox binding stays type-safe. */
+type BoolPrefKey = {
+  [K in keyof Prefs]: Prefs[K] extends boolean ? K : never;
+}[keyof Prefs];
+
+/** Pushes current prefs into every control, so the toolbar and the panel never disagree. */
+function syncPrefControls() {
+  const set = (id: string, fn: (el: HTMLInputElement) => void) => {
+    const el = document.querySelector<HTMLInputElement>(id);
+    if (el) fn(el);
+  };
+  const theme = document.querySelector<HTMLSelectElement>("#pref-theme");
+  if (theme) theme.value = prefs.theme;
+  set("#pref-font-size", (el) => (el.value = String(prefs.fontSize)));
+  set("#pref-word-wrap", (el) => (el.checked = prefs.wordWrap));
+  set("#pref-line-numbers", (el) => (el.checked = prefs.lineNumbers));
+  set("#pref-minimap", (el) => (el.checked = prefs.minimap));
+  set("#pref-whitespace", (el) => (el.checked = prefs.renderWhitespace));
+  set("#pref-match-case", (el) => (el.checked = prefs.matchCase));
+  set("#pref-window-lines", (el) => (el.value = String(prefs.windowLines)));
+  set("#word-wrap", (el) => (el.checked = prefs.wordWrap));
+  set("#match-case", (el) => (el.checked = prefs.matchCase));
+}
+
+/** Applies a preference change everywhere and persists it. */
+async function updatePref<K extends keyof Prefs>(key: K, value: Prefs[K]) {
+  const windowChanged = key === "windowLines" && value !== prefs.windowLines;
+  prefs[key] = value;
+  savePrefs();
+  applyPrefs();
+  syncPrefControls();
+
+  if (windowChanged) {
+    await anchorWindow(viewTop - Math.floor(windowLines() / 2));
+  }
+  // Wrapping and font size change visual line heights, so re-pin to the same file line.
+  scrollToViewTop();
+  updateScrollbar();
+}
+
+function wirePreferences() {
+  const overlay = document.querySelector<HTMLElement>("#prefs-overlay");
+  const open = () => {
+    syncPrefControls();
+    overlay?.removeAttribute("hidden");
+  };
+  const close = () => overlay?.setAttribute("hidden", "");
+
+  document.querySelector("#prefs-btn")?.addEventListener("click", open);
+  document.querySelector("#prefs-close")?.addEventListener("click", close);
+  overlay?.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
+
+  document.querySelector("#prefs-reset")?.addEventListener("click", () => {
+    prefs = { ...DEFAULT_PREFS };
+    savePrefs();
+    applyPrefs();
+    syncPrefControls();
+    void anchorWindow(viewTop - Math.floor(windowLines() / 2)).then(() => {
+      scrollToViewTop();
+      updateScrollbar();
+    });
+  });
+
+  const bindCheckbox = (id: string, key: BoolPrefKey) =>
+    document.querySelector(id)?.addEventListener("change", (e) => {
+      void updatePref(key, (e.target as HTMLInputElement).checked);
+    });
+
+  bindCheckbox("#pref-word-wrap", "wordWrap");
+  bindCheckbox("#pref-line-numbers", "lineNumbers");
+  bindCheckbox("#pref-minimap", "minimap");
+  bindCheckbox("#pref-whitespace", "renderWhitespace");
+  bindCheckbox("#pref-match-case", "matchCase");
+  bindCheckbox("#word-wrap", "wordWrap");
+
+  document.querySelector("#pref-theme")?.addEventListener("change", (e) => {
+    void updatePref(
+      "theme",
+      (e.target as HTMLSelectElement).value as Prefs["theme"]
+    );
+  });
+
+  document.querySelector("#pref-font-size")?.addEventListener("change", (e) => {
+    const v = Number((e.target as HTMLInputElement).value);
+    if (Number.isFinite(v)) {
+      void updatePref("fontSize", Math.min(Math.max(Math.round(v), 8), 40));
+    }
+  });
+
+  document
+    .querySelector("#pref-window-lines")
+    ?.addEventListener("change", (e) => {
+      const v = Number((e.target as HTMLInputElement).value);
+      if (Number.isFinite(v)) {
+        void updatePref(
+          "windowLines",
+          Math.min(Math.max(Math.round(v), 500), 20000)
+        );
+      }
+    });
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   const container = document.querySelector<HTMLDivElement>("#editor-container");
   if (!container) return;
+
+  loadPrefs();
 
   editor = monaco.editor.create(container, {
     value: "",
     language: "plaintext",
     automaticLayout: true,
-    minimap: { enabled: false },
-    wordWrap: "off",
     scrollBeyondLastLine: false,
     scrollbar: { vertical: "hidden", verticalScrollbarSize: 0 },
     // Everything loads as plaintext, so Monaco's "tokenization skipped on long lines" and
     // "rendering paused" hovers warn about work this app never does.
     hover: { showLongLineWarning: false },
-    lineNumbers: (modelLine) => String(toFileLine(modelLine)),
   });
+
+  applyPrefs();
+  syncPrefControls();
 
   editor.onDidScrollChange(() => {
     if (syncing) return;
@@ -356,6 +525,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   wireEditEvents();
   wireScrollbar();
+  wirePreferences();
 
   void listen<{ bytes_scanned: number; total_bytes: number }>(
     "scan-progress",
@@ -434,14 +604,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   matchCaseBox?.addEventListener("change", () => {
     lastQuery = null; // force a fresh search rather than stepping stale results
-  });
-
-  document.querySelector("#word-wrap")?.addEventListener("change", (e) => {
-    const on = (e.target as HTMLInputElement).checked;
-    editor.updateOptions({ wordWrap: on ? "on" : "off" });
-    // Wrapping changes visual line heights, so re-pin the viewport to the same file line.
-    scrollToViewTop();
-    updateScrollbar();
+    void updatePref("matchCase", currentMatchCase());
   });
 
   void invoke<string | null>("startup_path")

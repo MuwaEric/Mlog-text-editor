@@ -27,11 +27,78 @@
         <input type="checkbox" id="word-wrap" />
         Wrap
       </label>
+      <button id="prefs-btn" title="Preferences">⚙</button>
       <span id="status"></span>
     </div>
     <div id="editor-wrap">
       <div id="editor-container"></div>
       <div id="vscroll"><div id="vthumb"></div></div>
+    </div>
+
+    <div id="prefs-overlay" hidden>
+      <div id="prefs-panel" role="dialog" aria-label="Preferences">
+        <h2>Preferences</h2>
+
+        <label class="pref-row">
+          <span>Theme</span>
+          <select id="pref-theme">
+            <option value="vs">Light</option>
+            <option value="vs-dark">Dark</option>
+            <option value="hc-black">High contrast</option>
+          </select>
+        </label>
+
+        <label class="pref-row">
+          <span>Font size</span>
+          <input type="number" id="pref-font-size" min="8" max="40" step="1" />
+        </label>
+
+        <label class="pref-row">
+          <span>Wrap long lines</span>
+          <input type="checkbox" id="pref-word-wrap" />
+        </label>
+
+        <label class="pref-row">
+          <span>Show line numbers</span>
+          <input type="checkbox" id="pref-line-numbers" />
+        </label>
+
+        <label class="pref-row">
+          <span>Show minimap</span>
+          <input type="checkbox" id="pref-minimap" />
+        </label>
+
+        <label class="pref-row">
+          <span>Show whitespace</span>
+          <input type="checkbox" id="pref-whitespace" />
+        </label>
+
+        <label class="pref-row">
+          <span>Search is case-sensitive by default</span>
+          <input type="checkbox" id="pref-match-case" />
+        </label>
+
+        <label class="pref-row">
+          <span>Viewport window (lines)</span>
+          <input
+            type="number"
+            id="pref-window-lines"
+            min="500"
+            max="20000"
+            step="500"
+          />
+        </label>
+        <p class="pref-hint">
+          Lines kept in the editor at once. Larger means less reloading while
+          scrolling but more memory; lower it for files with very long lines.
+          The file itself is never fully loaded.
+        </p>
+
+        <div class="pref-actions">
+          <button id="prefs-reset">Reset to defaults</button>
+          <button id="prefs-close">Close</button>
+        </div>
+      </div>
     </div>
   </body>
 </html>

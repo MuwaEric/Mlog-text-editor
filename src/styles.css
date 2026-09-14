@@ -91,6 +91,71 @@ body {
   white-space: nowrap;
 }
 
+#prefs-btn {
+  padding: 0.2em 0.5em;
+  line-height: 1;
+}
+
+#prefs-overlay[hidden] {
+  display: none;
+}
+
+#prefs-overlay {
+  position: fixed;
+  inset: 0;
+  background: #00000066;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+#prefs-panel {
+  background: #fff;
+  color: #0f0f0f;
+  border-radius: 8px;
+  padding: 1.25em 1.5em;
+  min-width: 26em;
+  max-width: 90vw;
+  max-height: 85vh;
+  overflow: auto;
+  box-shadow: 0 8px 32px #00000055;
+}
+
+#prefs-panel h2 {
+  margin: 0 0 0.75em;
+  font-size: 1.1em;
+}
+
+.pref-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1em;
+  padding: 0.4em 0;
+  font-size: 0.9em;
+}
+
+.pref-row input[type="number"],
+.pref-row select {
+  width: 8em;
+  padding: 0.2em 0.4em;
+}
+
+.pref-hint {
+  margin: 0.5em 0 0;
+  font-size: 0.8em;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+.pref-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5em;
+  margin-top: 1.25em;
+}
+
 #editor-wrap {
   position: relative;
   height: calc(100vh - 3em);
