@@ -338,6 +338,9 @@ window.addEventListener("DOMContentLoaded", () => {
     wordWrap: "off",
     scrollBeyondLastLine: false,
     scrollbar: { vertical: "hidden", verticalScrollbarSize: 0 },
+    // Everything loads as plaintext, so Monaco's "tokenization skipped on long lines" and
+    // "rendering paused" hovers warn about work this app never does.
+    hover: { showLongLineWarning: false },
     lineNumbers: (modelLine) => String(toFileLine(modelLine)),
   });
 
