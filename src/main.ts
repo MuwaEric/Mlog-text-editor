@@ -390,6 +390,26 @@ window.addEventListener("DOMContentLoaded", () => {
     void runSearch(query).catch((err) => setStatus(`Search failed: ${err}`));
   };
 
+  // Monaco has no option to disable its find widget, and it would only ever search the loaded
+  // window, so its keybindings are captured and routed to the file-wide search instead.
+  const focusSearch = () => {
+    searchInput?.focus();
+    searchInput?.select();
+  };
+  const noop = () => {};
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, focusSearch);
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusSearch);
+  editor.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
+  editor.addCommand(
+    monaco.KeyMod.Shift | monaco.KeyCode.F3,
+    () => void gotoHit(hitIndex - 1)
+  );
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.F3, noop);
+  editor.addCommand(
+    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.F3,
+    noop
+  );
+
   document.querySelector("#search-btn")?.addEventListener("click", search);
 
   // Enter steps through existing results; it only re-runs the search when the query changed.
