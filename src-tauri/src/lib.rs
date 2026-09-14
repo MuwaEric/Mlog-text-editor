@@ -6,6 +6,7 @@
 
 use memmap2::Mmap;
 use rayon::prelude::*;
+use regex::bytes::RegexBuilder;
 use serde::Serialize;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
@@ -456,6 +457,28 @@ fn is_whole_word_match(table: &PieceTable, offset: usize, length: usize) -> bool
     !before.is_some_and(is_word_byte) && !after.is_some_and(is_word_byte)
 }
 
+fn search_regex_document(
+    table: &PieceTable,
+    regex: &regex::bytes::Regex,
+    whole_word: bool,
+) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    for (piece_index, piece) in table.pieces.iter().enumerate() {
+        let base = table.cum_bytes[piece_index];
+        let bytes = table.piece_bytes(piece);
+        for found in regex.find_iter(bytes) {
+            let offset = base + found.start();
+            let length = found.end().saturating_sub(found.start());
+            if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
+                matches.push((offset, length));
+            }
+        }
+    }
+    matches.sort_unstable_by_key(|&(offset, _)| offset);
+    matches.dedup_by_key(|(offset, _)| *offset);
+    matches
+}
+
 fn search_document_with_progress(
     table: &PieceTable,
     pattern: &[u8],
@@ -729,29 +752,52 @@ async fn search_text(
     match_case: bool,
     request_id: u64,
     whole_word: bool,
+    regex: bool,
 ) -> Result<SearchResult, String> {
+    let regex_engine = if regex {
+        Some(
+            RegexBuilder::new(&query)
+                .case_insensitive(!match_case)
+                .unicode(false)
+                .build()
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     with_table(&state, move |table| {
-        let pattern = if match_case {
-            query.as_bytes().to_vec()
+        let matches = if regex {
+            search_regex_document(
+                table,
+                regex_engine.as_ref().expect("regex engine is present"),
+                whole_word,
+            )
         } else {
-            fold_bytes(query.as_bytes())
+            let pattern = if match_case {
+                query.as_bytes().to_vec()
+            } else {
+                fold_bytes(query.as_bytes())
+            };
+            search_document_with_progress(
+                table,
+                &pattern,
+                !match_case,
+                whole_word,
+                Some(&app),
+                request_id,
+            )
+            .into_iter()
+            .map(|offset| (offset, pattern.len()))
+            .collect()
         };
-        let offsets = search_document_with_progress(
-            table,
-            &pattern,
-            !match_case,
-            whole_word,
-            Some(&app),
-            request_id,
-        );
-        let total_matches = offsets.len();
-        let hits = offsets
+        let total_matches = matches.len();
+        let hits = matches
             .iter()
             .take(MAX_REPORTED_HITS)
-            .map(|&byte_offset| {
+            .map(|&(byte_offset, match_length)| {
                 let (line, column) = table.position_of_offset(byte_offset);
                 let (end_line, end_column) =
-                    table.position_of_offset(byte_offset + pattern.len());
+                    table.position_of_offset(byte_offset + match_length);
                 SearchHit {
                     byte_offset,
                     line,
@@ -908,5 +954,30 @@ mod tests {
         t.insert_text(t.total_length(), "in and Spain");
         assert_eq!(whole(&t), "SPAin and Spain");
         assert_eq!(search_document(&t, &fold_bytes(b"spain"), true), vec![0, 10]);
+    }
+
+    #[test]
+    fn regex_search_returns_variable_length_matches() {
+        let t = table("Spain spainish SPAIN");
+        let regex = RegexBuilder::new(r"spain\w*")
+            .case_insensitive(true)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(
+            search_regex_document(&t, &regex, false),
+            vec![(0, 5), (6, 8), (15, 5)]
+        );
+    }
+
+    #[test]
+    fn regex_whole_word_filter_uses_document_boundaries() {
+        let t = table("Spain spainish SPAIN");
+        let regex = RegexBuilder::new("spain")
+            .case_insensitive(true)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(search_regex_document(&t, &regex, true), vec![(0, 5), (15, 5)]);
     }
 }

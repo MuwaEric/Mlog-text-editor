@@ -1314,6 +1314,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "rayon",
+ "regex",
  "serde",
  "serde_json",
  "tauri",

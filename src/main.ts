@@ -152,6 +152,7 @@ let hitsTruncated = false;
 let lastQuery: string | null = null;
 let lastMatchCase = false;
 let lastWholeWord = false;
+let lastRegex = false;
 let searchDecorationIds: string[] = [];
 let searchRequestId = 0;
 let activeSearchRequestId: number | null = null;
@@ -424,6 +425,8 @@ async function runSearch(query: string) {
     document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
   const wholeWord =
     document.querySelector<HTMLInputElement>("#whole-word")?.checked ?? false;
+  const regex =
+    document.querySelector<HTMLInputElement>("#regex-search")?.checked ?? false;
   setStatus("Searching…");
   await pendingEdits;
   if (requestId !== searchRequestId) return;
@@ -432,6 +435,7 @@ async function runSearch(query: string) {
     matchCase,
     requestId,
     wholeWord,
+    regex,
   });
   if (requestId !== searchRequestId) return;
   activeSearchRequestId = null;
@@ -444,6 +448,7 @@ async function runSearch(query: string) {
   lastQuery = query;
   lastMatchCase = matchCase;
   lastWholeWord = wholeWord;
+  lastRegex = regex;
   updateSearchDecorations();
   updateHitControls();
 
@@ -716,6 +721,8 @@ window.addEventListener("DOMContentLoaded", () => {
     document.querySelector<HTMLInputElement>("#match-case");
   const wholeWordBox =
     document.querySelector<HTMLInputElement>("#whole-word");
+  const regexBox =
+    document.querySelector<HTMLInputElement>("#regex-search");
 
   const currentMatchCase = () => matchCaseBox?.checked ?? false;
   const search = () => {
@@ -752,7 +759,8 @@ window.addEventListener("DOMContentLoaded", () => {
     const stale =
       searchInput.value !== lastQuery ||
       currentMatchCase() !== lastMatchCase ||
-      (wholeWordBox?.checked ?? false) !== lastWholeWord;
+      (wholeWordBox?.checked ?? false) !== lastWholeWord ||
+      (regexBox?.checked ?? false) !== lastRegex;
     if (stale || hits.length === 0) {
       search();
     } else {
@@ -772,6 +780,9 @@ window.addEventListener("DOMContentLoaded", () => {
     void updatePref("matchCase", currentMatchCase());
   });
   wholeWordBox?.addEventListener("change", () => {
+    lastQuery = null;
+  });
+  regexBox?.addEventListener("change", () => {
     lastQuery = null;
   });
 
