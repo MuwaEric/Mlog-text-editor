@@ -742,6 +742,17 @@ async fn delete_text(
     .await
 }
 
+/// Returns the zero-based byte offset for a 1-based file position.
+#[tauri::command]
+async fn byte_offset(
+    state: State<'_, AppState>,
+    line: usize,
+    column: usize,
+) -> Result<usize, String> {
+    with_table(&state, move |table| table.offset_of_position(line, column))
+        .await
+}
+
 /// Multi-threaded Boyer-Moore-Horspool search over the live document, with hits mapped back to
 /// Monaco positions through the piece table's line index. Case-insensitive unless `match_case`.
 #[tauri::command]
@@ -833,6 +844,7 @@ pub fn run() {
             get_lines,
             insert_text,
             delete_text,
+            byte_offset,
             search_text,
             startup_path
         ])

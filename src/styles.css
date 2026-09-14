@@ -103,6 +103,12 @@ body {
   white-space: nowrap;
 }
 
+#position {
+  font-size: 0.85em;
+  opacity: 0.9;
+  white-space: nowrap;
+}
+
 /* Pill switch: the checkbox stays focusable but is visually replaced by the track/knob. */
 .switch {
   display: inline-flex;

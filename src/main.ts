@@ -157,6 +157,7 @@ let searchDecorationIds: string[] = [];
 let searchRequestId = 0;
 let activeSearchRequestId: number | null = null;
 let streamedNavigationRequestId: number | null = null;
+let positionRequestId = 0;
 
 const toFileLine = (modelLine: number) => windowStart + modelLine - 1;
 const toModelLine = (fileLine: number) => fileLine - windowStart + 1;
@@ -196,6 +197,21 @@ function updateSearchDecorations() {
 function setStatus(message: string) {
   const el = document.querySelector<HTMLElement>("#status");
   if (el) el.textContent = message;
+}
+
+function updatePosition(modelLine: number, column: number) {
+  const position = document.querySelector<HTMLElement>("#position");
+  if (!position) return;
+  const fileLine = toFileLine(modelLine);
+  position.textContent = `Ln ${fileLine.toLocaleString()}, Col ${column.toLocaleString()}`;
+  const requestId = ++positionRequestId;
+  void invoke<number>("byte_offset", { line: fileLine, column })
+    .then((offset) => {
+      if (requestId !== positionRequestId) return;
+      position.textContent =
+        `Ln ${fileLine.toLocaleString()}, Col ${column.toLocaleString()} · Byte ${offset.toLocaleString()}`;
+    })
+    .catch(() => undefined);
 }
 
 function lineHeight(): number {
@@ -489,6 +505,7 @@ async function gotoHit(index: number) {
     editor.setSelection(range);
     editor.revealRangeInCenter(range, monaco.editor.ScrollType.Immediate);
     syncing = false;
+    updatePosition(startLine, hit.column);
   }
   updateSearchDecorations();
   updateHitControls();
@@ -677,6 +694,9 @@ window.addEventListener("DOMContentLoaded", () => {
     void maybeReanchor();
   });
   editor.onDidLayoutChange(() => updateScrollbar());
+  editor.onDidChangeCursorPosition(({ position }) => {
+    if (!syncing) updatePosition(position.lineNumber, position.column);
+  });
 
   wireEditEvents();
   wireScrollbar();
