@@ -40,8 +40,13 @@ body {
   padding: 0.3em 0.5em;
 }
 
-#file-path {
+#file-name {
   flex: 1 1 auto;
+  font-size: 0.85em;
+  opacity: 0.9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #status {
@@ -50,9 +55,37 @@ body {
   white-space: nowrap;
 }
 
-#editor-container {
+#editor-wrap {
+  position: relative;
   height: calc(100vh - 3em);
   width: 100%;
+}
+
+#editor-container {
+  position: absolute;
+  inset: 0 14px 0 0;
+}
+
+#vscroll {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  background: #00000014;
+}
+
+#vthumb {
+  position: absolute;
+  top: 0;
+  left: 2px;
+  width: 10px;
+  border-radius: 5px;
+  background: #79797999;
+}
+
+#vthumb:hover {
+  background: #5a5a5acc;
 }
 
 .container {

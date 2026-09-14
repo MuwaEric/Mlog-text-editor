@@ -10,12 +10,15 @@
 
   <body>
     <div id="toolbar">
-      <input id="file-path" placeholder="/path/to/huge-file.txt" />
-      <button id="open-btn">Open</button>
+      <button id="open-btn">Open File…</button>
+      <span id="file-name">No file open</span>
       <input id="search-input" placeholder="Find in file..." />
       <button id="search-btn">Search</button>
       <span id="status"></span>
     </div>
-    <div id="editor-container"></div>
+    <div id="editor-wrap">
+      <div id="editor-container"></div>
+      <div id="vscroll"><div id="vthumb"></div></div>
+    </div>
   </body>
 </html>

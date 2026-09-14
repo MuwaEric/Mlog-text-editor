@@ -37,14 +37,26 @@ struct Piece {
 /// A Piece Table: the original file is never mutated, edits only ever append to `added` and
 /// splice small metadata entries into `pieces`. This keeps insert/delete O(pieces) instead of
 /// O(file size), which is what makes editing an 8 GB+ file feel instant.
+///
+/// Line lookups are served by a two-level index: each buffer keeps a sorted vector of its own
+/// `\n` byte positions, and `cum_bytes`/`cum_lines` hold prefix sums across the piece list. A
+/// (line, column) query is therefore two binary searches, never a scan of the document.
 struct PieceTable {
     original: Arc<Mmap>,
+    /// Byte position of every `\n` in the original mmap; built once, off the UI thread.
+    original_nl: Arc<Vec<usize>>,
     added: String,
+    /// Byte position of every `\n` in the changes buffer; appended to on each insert, so it
+    /// stays sorted for free.
+    added_nl: Vec<usize>,
     pieces: Vec<Piece>,
+    /// Prefix sums over `pieces`, length `pieces.len() + 1`.
+    cum_bytes: Vec<usize>,
+    cum_lines: Vec<usize>,
 }
 
 impl PieceTable {
-    fn new(original: Arc<Mmap>) -> Self {
+    fn new(original: Arc<Mmap>, original_nl: Arc<Vec<usize>>) -> Self {
         let length = original.len();
         let pieces = if length > 0 {
             vec![Piece {
@@ -55,15 +67,17 @@ impl PieceTable {
         } else {
             Vec::new()
         };
-        Self {
+        let mut table = Self {
             original,
+            original_nl,
             added: String::new(),
+            added_nl: Vec::new(),
             pieces,
-        }
-    }
-
-    fn total_length(&self) -> usize {
-        self.pieces.iter().map(|p| p.length).sum()
+            cum_bytes: Vec::new(),
+            cum_lines: Vec::new(),
+        };
+        table.rebuild_index();
+        table
     }
 
     fn piece_bytes(&self, p: &Piece) -> &[u8] {
@@ -73,35 +87,85 @@ impl PieceTable {
         }
     }
 
-    /// Splits the piece straddling `position` (a byte offset into the *logical* document) so
-    /// that `position` always lands exactly on a piece boundary. Returns the index at which a
-    /// new piece can be inserted / a deletion range can start.
-    fn split_at(&mut self, position: usize) -> usize {
-        let mut consumed = 0usize;
-        for i in 0..self.pieces.len() {
+    /// The newline positions (absolute within their own buffer) that fall inside `p`.
+    fn piece_newlines(&self, p: &Piece) -> &[usize] {
+        let nl: &[usize] = match p.source {
+            Source::Original => &self.original_nl,
+            Source::Added => &self.added_nl,
+        };
+        let lo = nl.partition_point(|&x| x < p.offset);
+        let hi = nl.partition_point(|&x| x < p.offset + p.length);
+        &nl[lo..hi]
+    }
+
+    /// Recomputes the prefix sums. O(pieces), and every piece's newline count is itself two
+    /// binary searches, so this stays cheap as long as the piece list does.
+    fn rebuild_index(&mut self) {
+        let n = self.pieces.len();
+        let mut cum_bytes = Vec::with_capacity(n + 1);
+        let mut cum_lines = Vec::with_capacity(n + 1);
+        cum_bytes.push(0);
+        cum_lines.push(0);
+        let (mut bytes, mut lines) = (0usize, 0usize);
+        for i in 0..n {
             let p = self.pieces[i];
-            if consumed + p.length == position {
-                return i + 1;
-            }
-            if consumed + p.length > position {
-                let left_len = position - consumed;
-                let right_len = p.length - left_len;
-                let left = Piece {
-                    source: p.source,
-                    offset: p.offset,
-                    length: left_len,
-                };
-                let right = Piece {
-                    source: p.source,
-                    offset: p.offset + left_len,
-                    length: right_len,
-                };
-                self.pieces.splice(i..i + 1, [left, right]);
-                return i + 1;
-            }
-            consumed += p.length;
+            bytes += p.length;
+            lines += self.piece_newlines(&p).len();
+            cum_bytes.push(bytes);
+            cum_lines.push(lines);
         }
-        self.pieces.len()
+        self.cum_bytes = cum_bytes;
+        self.cum_lines = cum_lines;
+    }
+
+    fn total_length(&self) -> usize {
+        self.cum_bytes.last().copied().unwrap_or(0)
+    }
+
+    /// A document always has one more line than it has newlines (a trailing `\n` yields a final
+    /// empty line, which is what editors show).
+    fn total_lines(&self) -> usize {
+        self.cum_lines.last().copied().unwrap_or(0) + 1
+    }
+
+    /// Index of the piece containing logical byte `offset`.
+    fn piece_at_offset(&self, offset: usize) -> usize {
+        let last = self.pieces.len().saturating_sub(1);
+        self.cum_bytes
+            .partition_point(|&c| c <= offset)
+            .saturating_sub(1)
+            .min(last)
+    }
+
+    /// Ensures `position` lands exactly on a piece boundary, splitting the straddling piece if
+    /// needed. Returns the index of the piece that starts at `position`.
+    fn split_at(&mut self, position: usize) -> usize {
+        if position == 0 {
+            return 0;
+        }
+        if position >= self.total_length() {
+            return self.pieces.len();
+        }
+        let i = self.piece_at_offset(position);
+        let piece_start = self.cum_bytes[i];
+        if piece_start == position {
+            return i;
+        }
+        let p = self.pieces[i];
+        let left_len = position - piece_start;
+        let left = Piece {
+            source: p.source,
+            offset: p.offset,
+            length: left_len,
+        };
+        let right = Piece {
+            source: p.source,
+            offset: p.offset + left_len,
+            length: p.length - left_len,
+        };
+        self.pieces.splice(i..i + 1, [left, right]);
+        self.rebuild_index();
+        i + 1
     }
 
     /// Appends `text` to the changes buffer and splices a new piece into the table — no large
@@ -113,6 +177,9 @@ impl PieceTable {
         let position = position.min(self.total_length());
         let idx = self.split_at(position);
         let offset = self.added.len();
+        for rel in memchr::memchr_iter(b'\n', text.as_bytes()) {
+            self.added_nl.push(offset + rel);
+        }
         self.added.push_str(text);
         self.pieces.insert(
             idx,
@@ -122,9 +189,12 @@ impl PieceTable {
                 length: text.len(),
             },
         );
+        self.rebuild_index();
     }
 
     /// Removes `length` bytes starting at `position` by dropping/splitting piece metadata only.
+    /// Bytes orphaned in the changes buffer are intentionally left behind: the buffer is
+    /// append-only so that existing piece offsets never need rewriting.
     fn delete_text(&mut self, position: usize, length: usize) {
         if length == 0 {
             return;
@@ -138,106 +208,149 @@ impl PieceTable {
         let start_idx = self.split_at(position);
         let end_idx = self.split_at(end);
         self.pieces.drain(start_idx..end_idx);
+        self.rebuild_index();
     }
 
-    /// Reconstructs the logical byte range `[start, end)` by walking only the pieces that
-    /// overlap it — the only place where piece bytes are actually copied/materialized.
-    #[allow(dead_code)]
-    fn get_text_range(&self, start: usize, end: usize) -> String {
-        let mut out = Vec::with_capacity(end.saturating_sub(start));
-        let mut consumed = 0usize;
-        for p in &self.pieces {
-            let piece_start = consumed;
-            let piece_end = consumed + p.length;
-            consumed = piece_end;
-            if piece_end <= start || piece_start >= end {
-                continue;
-            }
+    /// Copies the logical byte range `[start, end)`, touching only the pieces that overlap it.
+    /// This is the only place piece bytes are actually materialized.
+    fn get_bytes_range(&self, start: usize, end: usize) -> Vec<u8> {
+        let total = self.total_length();
+        let start = start.min(total);
+        let end = end.min(total);
+        if end <= start {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(end - start);
+        let mut i = self.piece_at_offset(start);
+        while i < self.pieces.len() && self.cum_bytes[i] < end {
+            let piece_start = self.cum_bytes[i];
+            let p = self.pieces[i];
             let local_start = start.saturating_sub(piece_start);
             let local_end = (end - piece_start).min(p.length);
-            out.extend_from_slice(&self.piece_bytes(p)[local_start..local_end]);
+            if local_end > local_start {
+                out.extend_from_slice(&self.piece_bytes(&p)[local_start..local_end]);
+            }
+            i += 1;
         }
-        String::from_utf8_lossy(&out).into_owned()
+        out
     }
 
-    /// Returns the text of logical lines `[start_line, end_line)` (0-indexed, newline-inclusive)
-    /// without ever materializing the whole document. Stops walking as soon as `end_line` is
-    /// reached, so viewport fetches near the start of the file stay cheap even on huge files.
+    fn get_text_range(&self, start: usize, end: usize) -> String {
+        String::from_utf8_lossy(&self.get_bytes_range(start, end)).into_owned()
+    }
+
+    /// Logical byte offset at which 0-indexed `line` begins. Two binary searches, no scanning.
+    fn offset_of_line(&self, line: usize) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        let target = line - 1; // the newline that terminates the preceding line
+        if target >= self.cum_lines.last().copied().unwrap_or(0) {
+            return self.total_length();
+        }
+        let i = self.cum_lines.partition_point(|&c| c <= target) - 1;
+        let p = self.pieces[i];
+        let local = target - self.cum_lines[i];
+        let nl_pos = self.piece_newlines(&p)[local];
+        self.cum_bytes[i] + (nl_pos - p.offset) + 1
+    }
+
+    /// 0-indexed line containing logical byte `offset`.
+    fn line_for_offset(&self, offset: usize) -> usize {
+        if self.pieces.is_empty() {
+            return 0;
+        }
+        let offset = offset.min(self.total_length());
+        let i = self.piece_at_offset(offset);
+        let p = self.pieces[i];
+        let within = offset - self.cum_bytes[i];
+        let count = self
+            .piece_newlines(&p)
+            .partition_point(|&x| x < p.offset + within);
+        self.cum_lines[i] + count
+    }
+
+    /// Text of 0-indexed lines `[start_line, end_line)`, newline-inclusive.
     fn get_lines(&self, start_line: usize, end_line: usize) -> String {
         if end_line <= start_line {
             return String::new();
         }
-        let mut current_line = 0usize;
-        let mut out = Vec::new();
+        let start = self.offset_of_line(start_line);
+        let end = self.offset_of_line(end_line);
+        self.get_text_range(start, end)
+    }
 
-        'pieces: for p in &self.pieces {
-            let bytes = self.piece_bytes(p);
-            let mut pos = 0usize;
-            while pos < bytes.len() {
-                if current_line >= end_line {
-                    break 'pieces;
-                }
-                let collecting = current_line >= start_line;
-                match memchr::memchr(b'\n', &bytes[pos..]) {
-                    Some(rel) => {
-                        let nl = pos + rel;
-                        if collecting {
-                            out.extend_from_slice(&bytes[pos..=nl]);
-                        }
-                        pos = nl + 1;
-                        current_line += 1;
-                    }
-                    None => {
-                        if collecting {
-                            out.extend_from_slice(&bytes[pos..]);
-                        }
-                        break;
-                    }
-                }
-            }
-            if current_line >= end_line {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
+    /// Text of 0-indexed `line`, without its trailing line break.
+    fn line_text(&self, line: usize) -> String {
+        let start = self.offset_of_line(line);
+        let end = self.offset_of_line(line + 1);
+        let text = self.get_text_range(start, end);
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        text.strip_suffix('\r').unwrap_or(text).to_owned()
+    }
+
+    /// Converts a Monaco position (1-based line, 1-based UTF-16 column) to a logical byte
+    /// offset. The column must be walked through the real line text because Monaco counts
+    /// UTF-16 code units while the piece table counts bytes.
+    fn offset_of_position(&self, line: usize, column: usize) -> usize {
+        let line0 = line.saturating_sub(1);
+        let line_start = self.offset_of_line(line0);
+        let text = self.line_text(line0);
+        line_start + utf16_column_to_byte(&text, column.saturating_sub(1))
+    }
+
+    /// Inverse of `offset_of_position`.
+    fn position_of_offset(&self, offset: usize) -> (usize, usize) {
+        let line0 = self.line_for_offset(offset);
+        let line_start = self.offset_of_line(line0);
+        let prefix = self.get_text_range(line_start, offset);
+        (line0 + 1, utf16_len(&prefix) + 1)
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Line index (built once from the original mmap, used to map byte offsets -> line numbers)
-// ---------------------------------------------------------------------------------------------
-
-/// Byte offset of the start of each line in the *original* file, computed with a single fast
-/// byte loop over the mmap (via `memchr`) on a background thread so the UI never blocks.
-#[derive(Default)]
-struct LineIndex {
-    /// `line_starts[i]` = byte offset where line `i` begins in the original file.
-    line_starts: Vec<usize>,
+/// Byte index within `line` of the character at UTF-16 offset `column`.
+fn utf16_column_to_byte(line: &str, column: usize) -> usize {
+    let mut units = 0usize;
+    for (idx, ch) in line.char_indices() {
+        if units >= column {
+            return idx;
+        }
+        units += ch.len_utf16();
+    }
+    line.len()
 }
 
-impl LineIndex {
-    fn build(data: &[u8]) -> Self {
-        let mut line_starts = Vec::with_capacity(data.len() / 40 + 1);
-        line_starts.push(0);
-        for pos in memchr::memchr_iter(b'\n', data) {
-            if pos + 1 < data.len() {
-                line_starts.push(pos + 1);
-            }
-        }
-        Self { line_starts }
-    }
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(char::len_utf16).sum()
+}
 
-    fn line_count(&self) -> usize {
-        self.line_starts.len()
-    }
+// ---------------------------------------------------------------------------------------------
+// Initial newline scan over the mmap
+// ---------------------------------------------------------------------------------------------
 
-    /// Maps a byte offset in the original file to a 0-indexed line number via binary search.
-    fn line_for_offset(&self, offset: usize) -> usize {
-        match self.line_starts.binary_search(&offset) {
-            Ok(idx) => idx,
-            Err(idx) => idx.saturating_sub(1),
-        }
+/// Records the byte position of every `\n` in `data` with a fast SIMD byte loop (`memchr`),
+/// parallelized across `CHUNK_SIZE` chunks. This is the single full pass over the file, and it
+/// runs off the UI thread. Note the inherent cost: one `usize` per line, so a file with 200 M
+/// lines needs ~1.6 GB for the index alone.
+fn scan_newlines(data: &[u8], mut on_chunk: impl FnMut(usize) + Send) -> Vec<usize> {
+    let starts: Vec<usize> = (0..data.len()).step_by(CHUNK_SIZE).collect();
+    let per_chunk: Vec<Vec<usize>> = starts
+        .par_iter()
+        .map(|&s| {
+            let e = (s + CHUNK_SIZE).min(data.len());
+            memchr::memchr_iter(b'\n', &data[s..e])
+                .map(|rel| s + rel)
+                .collect()
+        })
+        .collect();
+
+    let total: usize = per_chunk.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total);
+    for mut chunk in per_chunk {
+        out.append(&mut chunk); // frees each chunk as it is merged, keeping peak memory down
+        on_chunk(out.len());
     }
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -272,46 +385,77 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8]) -> Vec<usize> {
     matches
 }
 
-/// Splits `data` into `CHUNK_SIZE` chunks (each padded with `pattern.len() - 1` bytes of overlap
-/// so matches straddling a chunk boundary are never missed) and searches them in parallel with
-/// rayon's work-stealing thread pool, maximizing sequential SSD read throughput.
-fn parallel_search(data: &[u8], pattern: &[u8]) -> Vec<usize> {
-    if pattern.is_empty() || data.len() < pattern.len() {
+/// Searches the *logical* document (original bytes plus user edits) in parallel.
+///
+/// Every piece is scanned independently, and pieces larger than `CHUNK_SIZE` are split further
+/// so the 8 GB original piece saturates all cores and the SSD's sequential read path. Two kinds
+/// of boundary are handled explicitly so no match is missed or double-counted:
+///   * chunk boundaries inside a piece — each chunk scans `pattern.len() - 1` bytes past its
+///     primary region, and reports only matches that *start* in the primary region;
+///   * piece boundaries — a small window around each one is re-scanned for matches that
+///     straddle it, which is the only way a match can span the original buffer and an edit.
+fn search_document(table: &PieceTable, pattern: &[u8]) -> Vec<usize> {
+    let m = pattern.len();
+    if m == 0 {
         return Vec::new();
     }
-    let chunk_size = CHUNK_SIZE;
-    let overlap = pattern.len() - 1;
+    let overlap = m - 1;
 
-    let chunk_starts: Vec<usize> = (0..data.len()).step_by(chunk_size).collect();
-    let mut results: Vec<usize> = chunk_starts
+    let tasks: Vec<(usize, usize)> = table
+        .pieces
+        .iter()
+        .enumerate()
+        .flat_map(|(i, p)| (0..p.length).step_by(CHUNK_SIZE).map(move |s| (i, s)))
+        .collect();
+
+    let mut hits: Vec<usize> = tasks
         .par_iter()
-        .flat_map(|&start| {
-            let end = (start + chunk_size + overlap).min(data.len());
-            let slice = &data[start..end];
-            boyer_moore_horspool(slice, pattern)
+        .flat_map(|&(i, s)| {
+            let p = table.pieces[i];
+            let bytes = table.piece_bytes(&p);
+            let primary_end = (s + CHUNK_SIZE).min(p.length);
+            let scan_end = (primary_end + overlap).min(p.length);
+            let base = table.cum_bytes[i] + s;
+            boyer_moore_horspool(&bytes[s..scan_end], pattern)
                 .into_iter()
-                // Drop matches found only inside the overlap tail; they belong to the next
-                // chunk's primary region and would otherwise be reported twice.
-                .filter(|&local| local < chunk_size)
-                .map(move |local| start + local)
+                .filter(move |&local| s + local < primary_end)
+                .map(move |local| base + local)
                 .collect::<Vec<_>>()
         })
         .collect();
-    results.sort_unstable();
-    results
+
+    let total = table.total_length();
+    let boundary_hits: Vec<usize> = (1..table.pieces.len())
+        .into_par_iter()
+        .flat_map(|i| {
+            let b = table.cum_bytes[i];
+            let lo = b.saturating_sub(overlap);
+            let hi = (b + overlap).min(total);
+            let window = table.get_bytes_range(lo, hi);
+            boyer_moore_horspool(&window, pattern)
+                .into_iter()
+                .map(move |local| lo + local)
+                .filter(move |&abs| abs < b && abs + m > b)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    hits.extend(boundary_hits);
+    hits.sort_unstable();
+    hits.dedup(); // a match spanning several tiny pieces is found at each boundary it crosses
+    hits
 }
 
 // ---------------------------------------------------------------------------------------------
 // Session / Tauri state
 // ---------------------------------------------------------------------------------------------
 
-struct EditorSession {
-    table: PieceTable,
-    line_index: Arc<LineIndex>,
-}
+/// Matches returned to the UI are capped: a search for "e" in an 8 GB file has billions of
+/// hits, and serializing them over IPC would defeat the whole point of streaming the file.
+const MAX_REPORTED_HITS: usize = 5_000;
 
 #[derive(Default)]
-struct AppState(Arc<Mutex<Option<EditorSession>>>);
+struct AppState(Arc<Mutex<Option<PieceTable>>>);
 
 #[derive(Serialize, Clone)]
 struct FileMeta {
@@ -319,6 +463,7 @@ struct FileMeta {
     size_bytes: usize,
 }
 
+/// 1-based line and UTF-16 column, i.e. directly usable as a Monaco `IPosition`.
 #[derive(Serialize, Clone)]
 struct SearchHit {
     byte_offset: usize,
@@ -327,13 +472,37 @@ struct SearchHit {
 }
 
 #[derive(Serialize, Clone)]
+struct SearchResult {
+    total_matches: usize,
+    truncated: bool,
+    hits: Vec<SearchHit>,
+}
+
+#[derive(Serialize, Clone)]
 struct ScanProgress {
     bytes_scanned: usize,
     total_bytes: usize,
 }
 
-/// Opens `path` with `mmap`, scans it for line breaks on a background (blocking) task so the UI
-/// thread is never blocked, then stores the resulting Piece Table + line index in app state.
+/// Runs `f` against the open document on a blocking thread so neither the mmap page faults nor
+/// the index work ever land on the UI thread.
+async fn with_table<T, F>(state: &State<'_, AppState>, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut PieceTable) -> T + Send + 'static,
+{
+    let inner = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = inner.lock().map_err(|e| e.to_string())?;
+        let table = guard.as_mut().ok_or("no file open")?;
+        Ok(f(table))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Opens `path` with `mmap` and scans it for line breaks on a background task, then stores the
+/// resulting Piece Table in app state.
 #[tauri::command]
 async fn open_file(
     app: tauri::AppHandle,
@@ -342,140 +511,228 @@ async fn open_file(
 ) -> Result<FileMeta, String> {
     let inner = state.0.clone();
 
-    let (mmap, line_index) = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+    let table = tauri::async_runtime::spawn_blocking(move || -> Result<PieceTable, String> {
         let file = File::open(&path).map_err(|e| e.to_string())?;
-        // SAFETY: the file is not expected to be truncated by another process while mapped;
-        // this is the standard caveat of memory-mapped I/O.
+        // SAFETY: as with any mmap, behaviour is undefined if another process truncates the
+        // file while it is mapped. That is the standard, unavoidable caveat of this approach.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
 
-        let total = mmap.len();
-        let _ = app.emit(
-            "scan-progress",
-            ScanProgress {
-                bytes_scanned: 0,
-                total_bytes: total,
-            },
-        );
-        let line_index = LineIndex::build(&mmap);
-        let _ = app.emit(
-            "scan-progress",
-            ScanProgress {
-                bytes_scanned: total,
-                total_bytes: total,
-            },
-        );
-        Ok((mmap, line_index))
+        let total_bytes = mmap.len();
+        let newlines = scan_newlines(&mmap, |scanned| {
+            let _ = app.emit(
+                "scan-progress",
+                ScanProgress {
+                    bytes_scanned: scanned,
+                    total_bytes,
+                },
+            );
+        });
+        Ok(PieceTable::new(Arc::new(mmap), Arc::new(newlines)))
     })
     .await
     .map_err(|e| e.to_string())??;
 
-    let mmap = Arc::new(mmap);
-    let size_bytes = mmap.len();
-    let table = PieceTable::new(mmap);
-    let line_index = Arc::new(line_index);
-    let total_lines = line_index.line_count().max(1);
-
-    *inner.lock().map_err(|e| e.to_string())? = Some(EditorSession { table, line_index });
-
-    Ok(FileMeta {
-        total_lines,
-        size_bytes,
-    })
+    let meta = FileMeta {
+        total_lines: table.total_lines(),
+        size_bytes: table.total_length(),
+    };
+    *inner.lock().map_err(|e| e.to_string())? = Some(table);
+    Ok(meta)
 }
 
-/// Fetches only the lines Monaco currently needs to render (its "virtual viewport"), never the
-/// whole document.
+/// Fetches only the lines Monaco currently needs to render (its virtual viewport), never the
+/// whole document. `start_line`/`end_line` are 1-based and inclusive, matching Monaco.
 #[tauri::command]
 async fn get_lines(
     state: State<'_, AppState>,
     start_line: usize,
     end_line: usize,
 ) -> Result<String, String> {
-    let inner = state.0.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let guard = inner.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or("no file open")?;
-        Ok(session.table.get_lines(start_line, end_line))
+    with_table(&state, move |table| {
+        table.get_lines(start_line.saturating_sub(1), end_line)
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
-/// Inserts `text` at logical byte offset `position` by splicing Piece Table metadata only.
+/// Inserts `text` at a Monaco position, splicing Piece Table metadata only. Returns the
+/// document's new line count so the frontend can keep its virtual viewport in sync.
 #[tauri::command]
-async fn insert_text(state: State<'_, AppState>, position: usize, text: String) -> Result<(), String> {
-    let inner = state.0.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = inner.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_mut().ok_or("no file open")?;
-        session.table.insert_text(position, &text);
-        Ok(())
+async fn insert_text(
+    state: State<'_, AppState>,
+    line: usize,
+    column: usize,
+    text: String,
+) -> Result<usize, String> {
+    with_table(&state, move |table| {
+        let offset = table.offset_of_position(line, column);
+        table.insert_text(offset, &text);
+        table.total_lines()
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
-/// Deletes `length` bytes starting at logical byte offset `position`, metadata-only.
+/// Deletes a Monaco range (1-based, end-exclusive column semantics), metadata only.
 #[tauri::command]
-async fn delete_text(state: State<'_, AppState>, position: usize, length: usize) -> Result<(), String> {
-    let inner = state.0.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = inner.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_mut().ok_or("no file open")?;
-        session.table.delete_text(position, length);
-        Ok(())
+async fn delete_text(
+    state: State<'_, AppState>,
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+) -> Result<usize, String> {
+    with_table(&state, move |table| {
+        let start = table.offset_of_position(start_line, start_column);
+        let end = table.offset_of_position(end_line, end_column);
+        table.delete_text(start, end.saturating_sub(start));
+        table.total_lines()
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
-/// Multi-threaded Boyer-Moore-Horspool search over the original file, with hits mapped back to
-/// line/column using the pre-built line index.
+/// Multi-threaded Boyer-Moore-Horspool search over the live document, with hits mapped back to
+/// Monaco positions through the piece table's line index.
 #[tauri::command]
-async fn search_text(state: State<'_, AppState>, query: String) -> Result<Vec<SearchHit>, String> {
-    let inner = state.0.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let guard = inner.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or("no file open")?;
-        let pattern = query.as_bytes();
-        let offsets = parallel_search(&session.table.original, pattern);
-
+async fn search_text(state: State<'_, AppState>, query: String) -> Result<SearchResult, String> {
+    with_table(&state, move |table| {
+        let offsets = search_document(table, query.as_bytes());
+        let total_matches = offsets.len();
         let hits = offsets
-            .into_iter()
-            .map(|offset| {
-                let line = session.line_index.line_for_offset(offset);
-                let line_start = session.line_index.line_starts[line];
+            .iter()
+            .take(MAX_REPORTED_HITS)
+            .map(|&byte_offset| {
+                let (line, column) = table.position_of_offset(byte_offset);
                 SearchHit {
-                    byte_offset: offset,
+                    byte_offset,
                     line,
-                    column: offset - line_start,
+                    column,
                 }
             })
             .collect();
-        Ok(hits)
+        SearchResult {
+            total_matches,
+            truncated: total_matches > MAX_REPORTED_HITS,
+            hits,
+        }
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
+/// Path given on the command line, so `giant-file-editor foo.txt` works.
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+fn startup_path() -> Option<String> {
+    std::env::args().nth(1).filter(|a| !a.starts_with('-'))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
-            greet,
             open_file,
             get_lines,
             insert_text,
             delete_text,
-            search_text
+            search_text,
+            startup_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Builds a table over a real temp file, since the original buffer must be an `Mmap`.
+    fn table(contents: &str) -> PieceTable {
+        let path = std::env::temp_dir().join(format!(
+            "gfe-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut f = File::create(&path).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        let mmap = unsafe { Mmap::map(&File::open(&path).unwrap()) }.unwrap();
+        let _ = std::fs::remove_file(&path); // unlinked but still mapped
+        let nl = scan_newlines(&mmap, |_| {});
+        PieceTable::new(Arc::new(mmap), Arc::new(nl))
+    }
+
+    fn whole(t: &PieceTable) -> String {
+        t.get_text_range(0, t.total_length())
+    }
+
+    #[test]
+    fn line_index_matches_naive_scan() {
+        let t = table("alpha\nbeta\ngamma\n\ndelta");
+        assert_eq!(t.total_lines(), 5);
+        assert_eq!(t.get_lines(0, 1), "alpha\n");
+        assert_eq!(t.get_lines(2, 4), "gamma\n\n");
+        assert_eq!(t.get_lines(4, 5), "delta");
+        assert_eq!(t.offset_of_line(1), 6);
+        assert_eq!(t.line_for_offset(6), 1);
+        assert_eq!(t.line_for_offset(5), 0); // the newline itself belongs to its own line
+    }
+
+    #[test]
+    fn trailing_newline_yields_final_empty_line() {
+        let t = table("a\nb\n");
+        assert_eq!(t.total_lines(), 3);
+        assert_eq!(t.get_lines(2, 3), "");
+    }
+
+    #[test]
+    fn index_survives_inserts_and_deletes() {
+        let mut t = table("one\ntwo\nthree\n");
+
+        // Insert a multi-line block in the middle of line 2.
+        let at = t.offset_of_position(2, 2);
+        t.insert_text(at, "X\nY");
+        assert_eq!(whole(&t), "one\ntX\nYwo\nthree\n");
+        assert_eq!(t.total_lines(), 5);
+        assert_eq!(t.get_lines(1, 3), "tX\nYwo\n");
+        assert_eq!(t.line_for_offset(whole(&t).find("three").unwrap()), 3);
+
+        // Delete across the piece boundary we just created.
+        let start = t.offset_of_position(2, 2);
+        let end = t.offset_of_position(3, 2);
+        t.delete_text(start, end - start);
+        assert_eq!(whole(&t), "one\ntwo\nthree\n");
+        assert_eq!(t.total_lines(), 4);
+    }
+
+    #[test]
+    fn positions_are_utf16_like_monaco() {
+        // "é" is 2 bytes / 1 UTF-16 unit; "𝄞" is 4 bytes / 2 UTF-16 units (a surrogate pair).
+        let t = table("aé𝄞b\nnext");
+        assert_eq!(t.offset_of_position(1, 1), 0);
+        assert_eq!(t.offset_of_position(1, 2), 1); // after 'a'
+        assert_eq!(t.offset_of_position(1, 3), 3); // after 'é'
+        assert_eq!(t.offset_of_position(1, 5), 7); // after the surrogate pair
+        assert_eq!(t.position_of_offset(7), (1, 5));
+        assert_eq!(t.position_of_offset(9), (2, 1));
+    }
+
+    #[test]
+    fn search_finds_matches_spanning_pieces() {
+        let mut t = table("hello wor");
+        t.insert_text(t.total_length(), "ld and hello world");
+        assert_eq!(whole(&t), "hello world and hello world");
+
+        let hits = search_document(&t, b"hello world");
+        assert_eq!(hits, vec![0, 16]); // the first match straddles the piece boundary
+        assert_eq!(t.position_of_offset(16), (1, 17));
+    }
+
+    #[test]
+    fn search_handles_overlapping_and_absent_patterns() {
+        let t = table("aaaa");
+        assert_eq!(search_document(&t, b"aa"), vec![0, 1, 2]);
+        assert!(search_document(&t, b"zz").is_empty());
+        assert!(search_document(&t, b"").is_empty());
+    }
 }
