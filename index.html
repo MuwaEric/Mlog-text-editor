@@ -44,13 +44,41 @@
           <select id="pref-theme">
             <option value="vs">Light</option>
             <option value="vs-dark">Dark</option>
-            <option value="hc-black">High contrast</option>
+            <option value="hc-light">High contrast light</option>
+            <option value="hc-black">High contrast dark</option>
           </select>
         </label>
 
         <label class="pref-row">
           <span>Font size</span>
           <input type="number" id="pref-font-size" min="8" max="40" step="1" />
+        </label>
+
+        <label class="pref-row">
+          <span>Font family</span>
+          <input type="text" id="pref-font-family" placeholder="default" />
+        </label>
+
+        <label class="pref-row">
+          <span>Font ligatures</span>
+          <input type="checkbox" id="pref-ligatures" />
+        </label>
+
+        <label class="pref-row">
+          <span>Cursor style</span>
+          <select id="pref-cursor-style">
+            <option value="line">Line</option>
+            <option value="line-thin">Line (thin)</option>
+            <option value="block">Block</option>
+            <option value="block-outline">Block (outline)</option>
+            <option value="underline">Underline</option>
+            <option value="underline-thin">Underline (thin)</option>
+          </select>
+        </label>
+
+        <label class="pref-row">
+          <span>Tab size</span>
+          <input type="number" id="pref-tab-size" min="1" max="16" step="1" />
         </label>
 
         <label class="pref-row">
@@ -71,6 +99,21 @@
         <label class="pref-row">
           <span>Show whitespace</span>
           <input type="checkbox" id="pref-whitespace" />
+        </label>
+
+        <label class="pref-row">
+          <span>Show control characters</span>
+          <input type="checkbox" id="pref-control-chars" />
+        </label>
+
+        <label class="pref-row">
+          <span>Bracket pair colorization</span>
+          <input type="checkbox" id="pref-bracket-colors" />
+        </label>
+
+        <label class="pref-row">
+          <span>Sticky scroll</span>
+          <input type="checkbox" id="pref-sticky-scroll" />
         </label>
 
         <label class="pref-row">

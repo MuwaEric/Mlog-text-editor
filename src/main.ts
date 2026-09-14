@@ -17,12 +17,25 @@ self.MonacoEnvironment = { getWorker: () => new editorWorker() };
 // windowStart + N - 1, so every position crossing the IPC boundary must be translated.
 
 interface Prefs {
-  theme: "vs" | "vs-dark" | "hc-black";
+  theme: "vs" | "vs-dark" | "hc-black" | "hc-light";
   fontSize: number;
+  fontFamily: string;
+  fontLigatures: boolean;
+  cursorStyle:
+    | "line"
+    | "block"
+    | "underline"
+    | "line-thin"
+    | "block-outline"
+    | "underline-thin";
+  tabSize: number;
   wordWrap: boolean;
   lineNumbers: boolean;
   minimap: boolean;
   renderWhitespace: boolean;
+  renderControlCharacters: boolean;
+  bracketPairColorization: boolean;
+  stickyScroll: boolean;
   matchCase: boolean;
   windowLines: number;
 }
@@ -30,16 +43,24 @@ interface Prefs {
 const DEFAULT_PREFS: Prefs = {
   theme: "vs",
   fontSize: 14,
+  fontFamily: "", // empty means Monaco's platform default
+  fontLigatures: false,
+  cursorStyle: "line",
+  tabSize: 4,
   wordWrap: false,
   lineNumbers: true,
   minimap: false,
   renderWhitespace: false,
+  renderControlCharacters: true,
+  bracketPairColorization: false,
+  stickyScroll: false,
   matchCase: false,
   windowLines: 4000,
 };
 
 const PREFS_KEY = "gfe.prefs";
 let prefs: Prefs = { ...DEFAULT_PREFS };
+let defaultFontFamily = "";
 
 const windowLines = () => prefs.windowLines;
 const reanchorMargin = () => Math.max(50, Math.floor(prefs.windowLines / 5));
@@ -55,6 +76,7 @@ function loadPrefs() {
   }
   prefs.windowLines = Math.min(Math.max(prefs.windowLines, 500), 20000);
   prefs.fontSize = Math.min(Math.max(prefs.fontSize, 8), 40);
+  prefs.tabSize = Math.min(Math.max(prefs.tabSize, 1), 16);
 }
 
 function savePrefs() {
@@ -69,13 +91,23 @@ function applyPrefs() {
   monaco.editor.setTheme(prefs.theme);
   editor.updateOptions({
     fontSize: prefs.fontSize,
+    fontFamily: prefs.fontFamily.trim() || defaultFontFamily,
+    fontLigatures: prefs.fontLigatures,
+    cursorStyle: prefs.cursorStyle,
     wordWrap: prefs.wordWrap ? "on" : "off",
     lineNumbers: prefs.lineNumbers
       ? (modelLine) => String(toFileLine(modelLine))
       : "off",
     minimap: { enabled: prefs.minimap },
     renderWhitespace: prefs.renderWhitespace ? "all" : "none",
+    renderControlCharacters: prefs.renderControlCharacters,
+    bracketPairColorization: { enabled: prefs.bracketPairColorization },
+    stickyScroll: { enabled: prefs.stickyScroll },
+    tabSize: prefs.tabSize,
+    // Without this, Monaco infers tabSize from file contents and ignores the setting.
+    detectIndentation: false,
   });
+  editor.getModel()?.updateOptions({ tabSize: prefs.tabSize });
 }
 
 interface FileMeta {
@@ -399,11 +431,25 @@ function syncPrefControls() {
   };
   const theme = document.querySelector<HTMLSelectElement>("#pref-theme");
   if (theme) theme.value = prefs.theme;
+  const cursor = document.querySelector<HTMLSelectElement>("#pref-cursor-style");
+  if (cursor) cursor.value = prefs.cursorStyle;
   set("#pref-font-size", (el) => (el.value = String(prefs.fontSize)));
+  set("#pref-font-family", (el) => (el.value = prefs.fontFamily));
+  set("#pref-ligatures", (el) => (el.checked = prefs.fontLigatures));
+  set("#pref-tab-size", (el) => (el.value = String(prefs.tabSize)));
   set("#pref-word-wrap", (el) => (el.checked = prefs.wordWrap));
   set("#pref-line-numbers", (el) => (el.checked = prefs.lineNumbers));
   set("#pref-minimap", (el) => (el.checked = prefs.minimap));
   set("#pref-whitespace", (el) => (el.checked = prefs.renderWhitespace));
+  set(
+    "#pref-control-chars",
+    (el) => (el.checked = prefs.renderControlCharacters)
+  );
+  set(
+    "#pref-bracket-colors",
+    (el) => (el.checked = prefs.bracketPairColorization)
+  );
+  set("#pref-sticky-scroll", (el) => (el.checked = prefs.stickyScroll));
   set("#pref-match-case", (el) => (el.checked = prefs.matchCase));
   set("#pref-window-lines", (el) => (el.value = String(prefs.windowLines)));
   set("#word-wrap", (el) => (el.checked = prefs.wordWrap));
@@ -463,8 +509,29 @@ function wirePreferences() {
   bindCheckbox("#pref-line-numbers", "lineNumbers");
   bindCheckbox("#pref-minimap", "minimap");
   bindCheckbox("#pref-whitespace", "renderWhitespace");
+  bindCheckbox("#pref-control-chars", "renderControlCharacters");
+  bindCheckbox("#pref-bracket-colors", "bracketPairColorization");
+  bindCheckbox("#pref-sticky-scroll", "stickyScroll");
+  bindCheckbox("#pref-ligatures", "fontLigatures");
   bindCheckbox("#pref-match-case", "matchCase");
   bindCheckbox("#word-wrap", "wordWrap");
+
+  const bindNumber = (
+    id: string,
+    key: "fontSize" | "tabSize" | "windowLines",
+    min: number,
+    max: number
+  ) =>
+    document.querySelector(id)?.addEventListener("change", (e) => {
+      const v = Number((e.target as HTMLInputElement).value);
+      if (Number.isFinite(v)) {
+        void updatePref(key, Math.min(Math.max(Math.round(v), min), max));
+      }
+    });
+
+  bindNumber("#pref-font-size", "fontSize", 8, 40);
+  bindNumber("#pref-tab-size", "tabSize", 1, 16);
+  bindNumber("#pref-window-lines", "windowLines", 500, 20000);
 
   document.querySelector("#pref-theme")?.addEventListener("change", (e) => {
     void updatePref(
@@ -473,23 +540,19 @@ function wirePreferences() {
     );
   });
 
-  document.querySelector("#pref-font-size")?.addEventListener("change", (e) => {
-    const v = Number((e.target as HTMLInputElement).value);
-    if (Number.isFinite(v)) {
-      void updatePref("fontSize", Math.min(Math.max(Math.round(v), 8), 40));
-    }
-  });
+  document
+    .querySelector("#pref-cursor-style")
+    ?.addEventListener("change", (e) => {
+      void updatePref(
+        "cursorStyle",
+        (e.target as HTMLSelectElement).value as Prefs["cursorStyle"]
+      );
+    });
 
   document
-    .querySelector("#pref-window-lines")
+    .querySelector("#pref-font-family")
     ?.addEventListener("change", (e) => {
-      const v = Number((e.target as HTMLInputElement).value);
-      if (Number.isFinite(v)) {
-        void updatePref(
-          "windowLines",
-          Math.min(Math.max(Math.round(v), 500), 20000)
-        );
-      }
+      void updatePref("fontFamily", (e.target as HTMLInputElement).value);
     });
 }
 
@@ -510,6 +573,8 @@ window.addEventListener("DOMContentLoaded", () => {
     hover: { showLongLineWarning: false },
   });
 
+  // Captured before any preference is applied, so "default" font can be restored later.
+  defaultFontFamily = editor.getOption(monaco.editor.EditorOption.fontFamily);
   applyPrefs();
   syncPrefControls();
 
