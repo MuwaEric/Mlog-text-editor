@@ -431,11 +431,16 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec
 ///     primary region, and reports only matches that *start* in the primary region;
 ///   * piece boundaries — a small window around each one is re-scanned for matches that
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
-fn search_document(
+fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
+    search_document_with_progress(table, pattern, fold_case, None, 0)
+}
+
+fn search_document_with_progress(
     table: &PieceTable,
     pattern: &[u8],
     fold_case: bool,
-    app: &tauri::AppHandle,
+    app: Option<&tauri::AppHandle>,
+    request_id: u64,
 ) -> Vec<usize> {
     let m = pattern.len();
     if m == 0 {
@@ -467,16 +472,35 @@ fn search_document(
                 .filter(move |&local| s + local < primary_end)
                 .map(move |local| base + local)
                 .collect::<Vec<_>>();
+            let streamed_hits = local_hits
+                .iter()
+                .map(|&byte_offset| {
+                    let (line, column) = table.position_of_offset(byte_offset);
+                    let (end_line, end_column) =
+                        table.position_of_offset(byte_offset + pattern.len());
+                    SearchHit {
+                        byte_offset,
+                        line,
+                        column,
+                        end_line,
+                        end_column,
+                    }
+                })
+                .collect();
             bytes_scanned.fetch_add(primary_end - s, Ordering::Relaxed);
             matches_found.fetch_add(local_hits.len(), Ordering::Relaxed);
-            let _ = app.emit(
-                "search-progress",
-                SearchProgress {
-                    bytes_scanned: bytes_scanned.load(Ordering::Relaxed),
-                    total_bytes,
-                    matches_found: matches_found.load(Ordering::Relaxed),
-                },
-            );
+            if let Some(app) = app {
+                let _ = app.emit(
+                    "search-progress",
+                    SearchProgress {
+                        request_id,
+                        bytes_scanned: bytes_scanned.load(Ordering::Relaxed),
+                        total_bytes,
+                        matches_found: matches_found.load(Ordering::Relaxed),
+                        hits: streamed_hits,
+                    },
+                );
+            }
             local_hits
         })
         .collect();
@@ -500,14 +524,18 @@ fn search_document(
     hits.extend(boundary_hits);
     hits.sort_unstable();
     hits.dedup(); // a match spanning several tiny pieces is found at each boundary it crosses
-    let _ = app.emit(
-        "search-progress",
-        SearchProgress {
-            bytes_scanned: total_bytes,
-            total_bytes,
-            matches_found: hits.len(),
-        },
-    );
+    if let Some(app) = app {
+        let _ = app.emit(
+            "search-progress",
+            SearchProgress {
+                request_id,
+                bytes_scanned: total_bytes,
+                total_bytes,
+                matches_found: hits.len(),
+                hits: Vec::new(),
+            },
+        );
+    }
     hits
 }
 
@@ -554,9 +582,11 @@ struct ScanProgress {
 
 #[derive(Serialize, Clone)]
 struct SearchProgress {
+    request_id: u64,
     bytes_scanned: usize,
     total_bytes: usize,
     matches_found: usize,
+    hits: Vec<SearchHit>,
 }
 
 /// Runs `f` against the open document on a blocking thread so neither the mmap page faults nor
@@ -672,6 +702,7 @@ async fn search_text(
     state: State<'_, AppState>,
     query: String,
     match_case: bool,
+    request_id: u64,
 ) -> Result<SearchResult, String> {
     with_table(&state, move |table| {
         let pattern = if match_case {
@@ -679,7 +710,13 @@ async fn search_text(
         } else {
             fold_bytes(query.as_bytes())
         };
-        let offsets = search_document(table, &pattern, !match_case, &app);
+        let offsets = search_document_with_progress(
+            table,
+            &pattern,
+            !match_case,
+            Some(&app),
+            request_id,
+        );
         let total_matches = offsets.len();
         let hits = offsets
             .iter()

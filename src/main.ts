@@ -130,9 +130,11 @@ interface SearchResult {
 }
 
 interface SearchProgress {
+  request_id: number;
   bytes_scanned: number;
   total_bytes: number;
   matches_found: number;
+  hits: SearchHit[];
 }
 
 let editor: monaco.editor.IStandaloneCodeEditor;
@@ -151,6 +153,8 @@ let lastQuery: string | null = null;
 let lastMatchCase = false;
 let searchDecorationIds: string[] = [];
 let searchRequestId = 0;
+let activeSearchRequestId: number | null = null;
+let streamedNavigationRequestId: number | null = null;
 
 const toFileLine = (modelLine: number) => windowStart + modelLine - 1;
 const toModelLine = (fileLine: number) => fileLine - windowStart + 1;
@@ -409,13 +413,24 @@ function wireEditEvents() {
 async function runSearch(query: string) {
   if (!query) return;
   const requestId = ++searchRequestId;
+  activeSearchRequestId = requestId;
+  streamedNavigationRequestId = null;
+  hits = [];
+  hitIndex = -1;
+  updateSearchDecorations();
+  updateHitControls();
   const matchCase =
     document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
   setStatus("Searching…");
   await pendingEdits;
   if (requestId !== searchRequestId) return;
-  const result = await invoke<SearchResult>("search_text", { query, matchCase });
+  const result = await invoke<SearchResult>("search_text", {
+    query,
+    matchCase,
+    requestId,
+  });
   if (requestId !== searchRequestId) return;
+  activeSearchRequestId = null;
   const shown = result.truncated ? ` (first ${result.hits.length} navigable)` : "";
   setStatus(`${result.total_matches.toLocaleString()} match(es)${shown}`);
 
@@ -667,6 +682,7 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   );
   void listen<SearchProgress>("search-progress", ({ payload }) => {
+    if (payload.request_id !== activeSearchRequestId) return;
     if (payload.total_bytes === 0) return;
     const pct = Math.floor(
       (payload.bytes_scanned / payload.total_bytes) * 100
@@ -674,6 +690,19 @@ window.addEventListener("DOMContentLoaded", () => {
     setStatus(
       `Searching… ${pct}% · ${payload.matches_found.toLocaleString()} match(es) found`
     );
+    if (payload.hits.length === 0) return;
+    hits = [...hits, ...payload.hits];
+    hits.sort((left, right) => left.byte_offset - right.byte_offset);
+    hits = hits.filter(
+      (hit, index, all) => index === 0 || hit.byte_offset !== all[index - 1].byte_offset
+    );
+    hitsTruncated = hits.length >= 5000;
+    updateSearchDecorations();
+    updateHitControls();
+    if (streamedNavigationRequestId !== activeSearchRequestId && hits.length > 0) {
+      streamedNavigationRequestId = activeSearchRequestId;
+      void gotoHit(0);
+    }
   });
 
   const searchInput =
