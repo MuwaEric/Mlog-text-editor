@@ -40,6 +40,15 @@ interface Prefs {
   windowLines: number;
 }
 
+const MIN_VIEWPORT_WINDOW_LINES = 500;
+const MAX_VIEWPORT_WINDOW_LINES = 20000;
+
+const clampViewportWindowLines = (value: number) =>
+  Math.min(
+    Math.max(Math.round(value), MIN_VIEWPORT_WINDOW_LINES),
+    MAX_VIEWPORT_WINDOW_LINES
+  );
+
 const DEFAULT_PREFS: Prefs = {
   theme: "vs",
   fontSize: 14,
@@ -62,8 +71,8 @@ const PREFS_KEY = "gfe.prefs";
 let prefs: Prefs = { ...DEFAULT_PREFS };
 let defaultFontFamily = "";
 
-const windowLines = () => prefs.windowLines;
-const reanchorMargin = () => Math.max(50, Math.floor(prefs.windowLines / 5));
+const windowLines = () => clampViewportWindowLines(prefs.windowLines);
+const reanchorMargin = () => Math.max(50, Math.floor(windowLines() / 5));
 
 function loadPrefs() {
   try {
@@ -74,7 +83,7 @@ function loadPrefs() {
   } catch {
     prefs = { ...DEFAULT_PREFS };
   }
-  prefs.windowLines = Math.min(Math.max(prefs.windowLines, 500), 20000);
+  prefs.windowLines = clampViewportWindowLines(prefs.windowLines);
   prefs.fontSize = Math.min(Math.max(prefs.fontSize, 8), 40);
   prefs.tabSize = Math.min(Math.max(prefs.tabSize, 1), 16);
 }
@@ -458,8 +467,9 @@ function syncPrefControls() {
 
 /** Applies a preference change everywhere and persists it. */
 async function updatePref<K extends keyof Prefs>(key: K, value: Prefs[K]) {
-  const windowChanged = key === "windowLines" && value !== prefs.windowLines;
-  prefs[key] = value;
+  const rawValue = key === "windowLines" ? clampViewportWindowLines(Number(value)) : value;
+  const windowChanged = key === "windowLines" && rawValue !== prefs.windowLines;
+  prefs[key] = rawValue as Prefs[K];
   savePrefs();
   applyPrefs();
   syncPrefControls();
@@ -531,7 +541,12 @@ function wirePreferences() {
 
   bindNumber("#pref-font-size", "fontSize", 8, 40);
   bindNumber("#pref-tab-size", "tabSize", 1, 16);
-  bindNumber("#pref-window-lines", "windowLines", 500, 20000);
+  bindNumber(
+    "#pref-window-lines",
+    "windowLines",
+    MIN_VIEWPORT_WINDOW_LINES,
+    MAX_VIEWPORT_WINDOW_LINES
+  );
 
   document.querySelector("#pref-theme")?.addEventListener("change", (e) => {
     void updatePref(
