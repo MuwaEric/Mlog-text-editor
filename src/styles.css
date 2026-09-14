@@ -55,6 +55,15 @@ body {
   white-space: nowrap;
 }
 
+#match-case-label {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  font-size: 0.85em;
+  white-space: nowrap;
+  user-select: none;
+}
+
 #editor-wrap {
   position: relative;
   height: calc(100vh - 3em);

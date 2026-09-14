@@ -357,9 +357,31 @@ fn scan_newlines(data: &[u8], mut on_chunk: impl FnMut(usize) + Send) -> Vec<usi
 // Search: Boyer-Moore-Horspool, parallelized across byte chunks with rayon
 // ---------------------------------------------------------------------------------------------
 
+/// ASCII case-folding table. Non-ASCII bytes pass through untouched, so this matches
+/// `Spain`/`sPain`/`SPAIN` but not `É`/`é` — proper Unicode folding cannot be done byte-wise,
+/// because folding can change a string's length.
+static FOLD: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = if i >= b'A' as usize && i <= b'Z' as usize {
+            i as u8 + 32
+        } else {
+            i as u8
+        };
+        i += 1;
+    }
+    t
+};
+
+fn fold_bytes(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().map(|&b| FOLD[b as usize]).collect()
+}
+
 /// Single-threaded Boyer-Moore-Horspool search over one slice. Returns match start offsets
-/// relative to the start of `haystack`.
-fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8]) -> Vec<usize> {
+/// relative to the start of `haystack`. When `fold_case` is set, `pattern` must already be
+/// folded; the haystack is folded byte-by-byte as it is scanned.
+fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec<usize> {
     let mut matches = Vec::new();
     let m = pattern.len();
     if m == 0 || haystack.len() < m {
@@ -375,11 +397,25 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8]) -> Vec<usize> {
     let mut i = 0usize;
     while i + m <= haystack.len() {
         let window = &haystack[i..i + m];
-        if window[m - 1] == last && window == pattern {
+        let tail = if fold_case {
+            FOLD[window[m - 1] as usize]
+        } else {
+            window[m - 1]
+        };
+        let hit = tail == last
+            && if fold_case {
+                window
+                    .iter()
+                    .zip(pattern)
+                    .all(|(&h, &p)| FOLD[h as usize] == p)
+            } else {
+                window == pattern
+            };
+        if hit {
             matches.push(i);
             i += 1; // keep scanning to allow overlapping matches
         } else {
-            i += shift[window[m - 1] as usize];
+            i += shift[tail as usize];
         }
     }
     matches
@@ -394,7 +430,7 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8]) -> Vec<usize> {
 ///     primary region, and reports only matches that *start* in the primary region;
 ///   * piece boundaries — a small window around each one is re-scanned for matches that
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
-fn search_document(table: &PieceTable, pattern: &[u8]) -> Vec<usize> {
+fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
     let m = pattern.len();
     if m == 0 {
         return Vec::new();
@@ -416,7 +452,7 @@ fn search_document(table: &PieceTable, pattern: &[u8]) -> Vec<usize> {
             let primary_end = (s + CHUNK_SIZE).min(p.length);
             let scan_end = (primary_end + overlap).min(p.length);
             let base = table.cum_bytes[i] + s;
-            boyer_moore_horspool(&bytes[s..scan_end], pattern)
+            boyer_moore_horspool(&bytes[s..scan_end], pattern, fold_case)
                 .into_iter()
                 .filter(move |&local| s + local < primary_end)
                 .map(move |local| base + local)
@@ -432,7 +468,7 @@ fn search_document(table: &PieceTable, pattern: &[u8]) -> Vec<usize> {
             let lo = b.saturating_sub(overlap);
             let hi = (b + overlap).min(total);
             let window = table.get_bytes_range(lo, hi);
-            boyer_moore_horspool(&window, pattern)
+            boyer_moore_horspool(&window, pattern, fold_case)
                 .into_iter()
                 .map(move |local| lo + local)
                 .filter(move |&abs| abs < b && abs + m > b)
@@ -590,11 +626,20 @@ async fn delete_text(
 }
 
 /// Multi-threaded Boyer-Moore-Horspool search over the live document, with hits mapped back to
-/// Monaco positions through the piece table's line index.
+/// Monaco positions through the piece table's line index. Case-insensitive unless `match_case`.
 #[tauri::command]
-async fn search_text(state: State<'_, AppState>, query: String) -> Result<SearchResult, String> {
+async fn search_text(
+    state: State<'_, AppState>,
+    query: String,
+    match_case: bool,
+) -> Result<SearchResult, String> {
     with_table(&state, move |table| {
-        let offsets = search_document(table, query.as_bytes());
+        let pattern = if match_case {
+            query.as_bytes().to_vec()
+        } else {
+            fold_bytes(query.as_bytes())
+        };
+        let offsets = search_document(table, &pattern, !match_case);
         let total_matches = offsets.len();
         let hits = offsets
             .iter()
@@ -723,7 +768,7 @@ mod tests {
         t.insert_text(t.total_length(), "ld and hello world");
         assert_eq!(whole(&t), "hello world and hello world");
 
-        let hits = search_document(&t, b"hello world");
+        let hits = search_document(&t, b"hello world", false);
         assert_eq!(hits, vec![0, 16]); // the first match straddles the piece boundary
         assert_eq!(t.position_of_offset(16), (1, 17));
     }
@@ -731,8 +776,29 @@ mod tests {
     #[test]
     fn search_handles_overlapping_and_absent_patterns() {
         let t = table("aaaa");
-        assert_eq!(search_document(&t, b"aa"), vec![0, 1, 2]);
-        assert!(search_document(&t, b"zz").is_empty());
-        assert!(search_document(&t, b"").is_empty());
+        assert_eq!(search_document(&t, b"aa", false), vec![0, 1, 2]);
+        assert!(search_document(&t, b"zz", false).is_empty());
+        assert!(search_document(&t, b"", false).is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_search_matches_any_casing() {
+        let t = table("Spain sPain SPAIN spain rain");
+        let hits = search_document(&t, &fold_bytes(b"spain"), true);
+        assert_eq!(hits, vec![0, 6, 12, 18]);
+
+        // An upper-case query folds to the same thing.
+        assert_eq!(search_document(&t, &fold_bytes(b"SpAiN"), true), hits);
+
+        // Case-sensitive mode still discriminates.
+        assert_eq!(search_document(&t, b"spain", false), vec![18]);
+    }
+
+    #[test]
+    fn case_insensitive_search_spans_pieces() {
+        let mut t = table("SPA");
+        t.insert_text(t.total_length(), "in and Spain");
+        assert_eq!(whole(&t), "SPAin and Spain");
+        assert_eq!(search_document(&t, &fold_bytes(b"spain"), true), vec![0, 10]);
     }
 }

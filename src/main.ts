@@ -245,9 +245,11 @@ function wireEditEvents() {
 
 async function runSearch(query: string) {
   if (!query) return;
+  const matchCase =
+    document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
   setStatus("Searching…");
   await pendingEdits;
-  const result = await invoke<SearchResult>("search_text", { query });
+  const result = await invoke<SearchResult>("search_text", { query, matchCase });
   const shown = result.truncated ? ` (showing first ${result.hits.length})` : "";
   setStatus(`${result.total_matches.toLocaleString()} match(es)${shown}`);
 
