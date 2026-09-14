@@ -21,6 +21,40 @@
   -webkit-text-size-adjust: 100%;
 }
 
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.5em;
+  background: #1e1e1e;
+  color: #eee;
+}
+
+#toolbar input {
+  padding: 0.3em 0.5em;
+}
+
+#file-path {
+  flex: 1 1 auto;
+}
+
+#status {
+  font-size: 0.85em;
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+#editor-container {
+  height: calc(100vh - 3em);
+  width: 100%;
+}
+
 .container {
   margin: 0;
   padding-top: 10vh;
