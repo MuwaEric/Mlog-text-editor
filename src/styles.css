@@ -255,6 +255,21 @@ body {
   inset: 0 14px 0 0;
 }
 
+/* Search matches remain visible after the active selection moves. */
+.monaco-editor .gfe-search-match {
+  background: #f59e0b66;
+  border-bottom: 2px solid #fbbf24;
+  color: inherit;
+}
+
+.monaco-editor .gfe-search-current {
+  background: #06b6d4cc;
+  border: 1px solid #67e8f9;
+  border-radius: 2px;
+  color: #06202a;
+  font-weight: 700;
+}
+
 #vscroll {
   position: absolute;
   top: 0;

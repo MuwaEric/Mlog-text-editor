@@ -143,9 +143,42 @@ let hitIndex = -1;
 let hitsTruncated = false;
 let lastQuery: string | null = null;
 let lastMatchCase = false;
+let searchDecorationIds: string[] = [];
 
 const toFileLine = (modelLine: number) => windowStart + modelLine - 1;
 const toModelLine = (fileLine: number) => fileLine - windowStart + 1;
+
+/** Paints navigable search hits in the current bounded Monaco window. */
+function updateSearchDecorations() {
+  if (!editor) return;
+  const decorations: monaco.editor.IModelDeltaDecoration[] = [];
+  for (let index = 0; index < hits.length; index++) {
+    const hit = hits[index];
+    const startLine = toModelLine(hit.line);
+    const endLine = toModelLine(hit.end_line);
+    if (startLine < 1 || endLine > windowCount) continue;
+    decorations.push({
+      range: new monaco.Range(
+        startLine,
+        hit.column,
+        endLine,
+        hit.end_column
+      ),
+      options: {
+        inlineClassName:
+          index === hitIndex ? "gfe-search-current" : "gfe-search-match",
+        overviewRuler: {
+          color: index === hitIndex ? "#22d3ee" : "#f59e0b",
+          position: monaco.editor.OverviewRulerLane.Center,
+        },
+      },
+    });
+  }
+  searchDecorationIds = editor.deltaDecorations(
+    searchDecorationIds,
+    decorations
+  );
+}
 
 function setStatus(message: string) {
   const el = document.querySelector<HTMLElement>("#status");
@@ -196,6 +229,7 @@ async function anchorWindow(start: number) {
   model.setValue(text);
   windowStart = newStart;
   windowCount = model.getLineCount();
+  updateSearchDecorations();
   syncing = false;
 }
 
@@ -380,6 +414,7 @@ async function runSearch(query: string) {
   hitIndex = -1;
   lastQuery = query;
   lastMatchCase = matchCase;
+  updateSearchDecorations();
   updateHitControls();
 
   if (hits.length > 0) await gotoHit(0);
@@ -420,6 +455,7 @@ async function gotoHit(index: number) {
     editor.revealRangeInCenter(range, monaco.editor.ScrollType.Immediate);
     syncing = false;
   }
+  updateSearchDecorations();
   updateHitControls();
 }
 
