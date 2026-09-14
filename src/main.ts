@@ -129,6 +129,12 @@ interface SearchResult {
   hits: SearchHit[];
 }
 
+interface SearchProgress {
+  bytes_scanned: number;
+  total_bytes: number;
+  matches_found: number;
+}
+
 let editor: monaco.editor.IStandaloneCodeEditor;
 let totalLines = 1;
 let windowStart = 1; // file line shown as model line 1
@@ -660,6 +666,15 @@ window.addEventListener("DOMContentLoaded", () => {
       setStatus(`Scanning line offsets… ${pct}%`);
     }
   );
+  void listen<SearchProgress>("search-progress", ({ payload }) => {
+    if (payload.total_bytes === 0) return;
+    const pct = Math.floor(
+      (payload.bytes_scanned / payload.total_bytes) * 100
+    );
+    setStatus(
+      `Searching… ${pct}% · ${payload.matches_found.toLocaleString()} match(es) found`
+    );
+  });
 
   const searchInput =
     document.querySelector<HTMLInputElement>("#search-input");

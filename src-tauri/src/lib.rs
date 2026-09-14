@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::{Emitter, State};
 
 /// Bytes read per parallel search/scan chunk (64 MiB) — large enough to amortize thread
@@ -430,7 +431,12 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec
 ///     primary region, and reports only matches that *start* in the primary region;
 ///   * piece boundaries — a small window around each one is re-scanned for matches that
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
-fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
+fn search_document(
+    table: &PieceTable,
+    pattern: &[u8],
+    fold_case: bool,
+    app: &tauri::AppHandle,
+) -> Vec<usize> {
     let m = pattern.len();
     if m == 0 {
         return Vec::new();
@@ -444,6 +450,10 @@ fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<u
         .flat_map(|(i, p)| (0..p.length).step_by(CHUNK_SIZE).map(move |s| (i, s)))
         .collect();
 
+    let bytes_scanned = Arc::new(AtomicUsize::new(0));
+    let matches_found = Arc::new(AtomicUsize::new(0));
+    let total_bytes = table.total_length();
+
     let mut hits: Vec<usize> = tasks
         .par_iter()
         .flat_map(|&(i, s)| {
@@ -452,11 +462,22 @@ fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<u
             let primary_end = (s + CHUNK_SIZE).min(p.length);
             let scan_end = (primary_end + overlap).min(p.length);
             let base = table.cum_bytes[i] + s;
-            boyer_moore_horspool(&bytes[s..scan_end], pattern, fold_case)
+            let local_hits = boyer_moore_horspool(&bytes[s..scan_end], pattern, fold_case)
                 .into_iter()
                 .filter(move |&local| s + local < primary_end)
                 .map(move |local| base + local)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            bytes_scanned.fetch_add(primary_end - s, Ordering::Relaxed);
+            matches_found.fetch_add(local_hits.len(), Ordering::Relaxed);
+            let _ = app.emit(
+                "search-progress",
+                SearchProgress {
+                    bytes_scanned: bytes_scanned.load(Ordering::Relaxed),
+                    total_bytes,
+                    matches_found: matches_found.load(Ordering::Relaxed),
+                },
+            );
+            local_hits
         })
         .collect();
 
@@ -479,6 +500,14 @@ fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<u
     hits.extend(boundary_hits);
     hits.sort_unstable();
     hits.dedup(); // a match spanning several tiny pieces is found at each boundary it crosses
+    let _ = app.emit(
+        "search-progress",
+        SearchProgress {
+            bytes_scanned: total_bytes,
+            total_bytes,
+            matches_found: hits.len(),
+        },
+    );
     hits
 }
 
@@ -521,6 +550,13 @@ struct SearchResult {
 struct ScanProgress {
     bytes_scanned: usize,
     total_bytes: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct SearchProgress {
+    bytes_scanned: usize,
+    total_bytes: usize,
+    matches_found: usize,
 }
 
 /// Runs `f` against the open document on a blocking thread so neither the mmap page faults nor
@@ -632,6 +668,7 @@ async fn delete_text(
 /// Monaco positions through the piece table's line index. Case-insensitive unless `match_case`.
 #[tauri::command]
 async fn search_text(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     query: String,
     match_case: bool,
@@ -642,7 +679,7 @@ async fn search_text(
         } else {
             fold_bytes(query.as_bytes())
         };
-        let offsets = search_document(table, &pattern, !match_case);
+        let offsets = search_document(table, &pattern, !match_case, &app);
         let total_matches = offsets.len();
         let hits = offsets
             .iter()
