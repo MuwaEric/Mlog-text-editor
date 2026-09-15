@@ -167,10 +167,33 @@ let currentPath: string | null = null;
 let dirty = false;
 
 const RECOVERY_KEY = "gfe.recovery";
+const LINE_CACHE_KEY = "gfe.line-cache";
 
 interface RecoveryRecord {
   path: string;
   timestamp: number;
+}
+
+interface FilePositionRecord {
+  line: number;
+  column: number;
+}
+
+function readLineCache(): Record<string, FilePositionRecord> {
+  try {
+    const raw = localStorage.getItem(LINE_CACHE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, FilePositionRecord>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeLineCache(path: string, position: FilePositionRecord) {
+  try {
+    const cache = readLineCache();
+    cache[path] = position;
+    localStorage.setItem(LINE_CACHE_KEY, JSON.stringify(cache));
+  } catch {}
 }
 
 function persistRecoveryState() {
@@ -497,6 +520,13 @@ function scrollToViewTop() {
 /** Moves the viewport so `fileLine` is the top visible line, re-anchoring the window if needed. */
 async function goToLine(fileLine: number) {
   viewTop = Math.min(Math.max(1, Math.round(fileLine)), maxViewTop());
+  if (currentPath) {
+    const pos = editor?.getPosition();
+    writeLineCache(currentPath, {
+      line: viewTop,
+      column: pos ? pos.column : 1,
+    });
+  }
   const visible = linesPerScreen();
   const needsWindow =
     windowCount === 0 ||
@@ -591,7 +621,11 @@ async function openFile(path: string) {
   totalLines = meta.total_lines;
   windowStart = 1;
   windowCount = 0;
-  viewTop = 1;
+
+  const cachedPos = readLineCache()[path];
+  const targetFileLine = cachedPos && Number.isFinite(cachedPos.line) ? Math.max(1, cachedPos.line) : 1;
+  const targetCol = cachedPos && Number.isFinite(cachedPos.column) ? Math.max(1, cachedPos.column) : 1;
+  viewTop = targetFileLine;
 
   const hasUnsavedRecovery = checkRecoveryState(path);
   const nameEl = document.querySelector<HTMLElement>("#file-name");
@@ -605,9 +639,15 @@ async function openFile(path: string) {
   lastQuery = null;
   updateHitControls();
 
-  await anchorWindow(1);
+  await anchorWindow(viewTop);
   scrollToViewTop();
   updateScrollbar();
+
+  const modelLine = toModelLine(targetFileLine);
+  if (modelLine >= 1 && modelLine <= windowCount) {
+    editor.setPosition({ lineNumber: modelLine, column: targetCol });
+  }
+
   const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline}`;
   setStatus(
     hasUnsavedRecovery
@@ -1046,12 +1086,27 @@ function initApp() {
     const r = visibleModelRange();
     if (!r) return;
     viewTop = toFileLine(r.start);
+    if (currentPath) {
+      const pos = editor?.getPosition();
+      writeLineCache(currentPath, {
+        line: viewTop,
+        column: pos ? pos.column : 1,
+      });
+    }
     updateScrollbar();
     void maybeReanchor();
   });
   editor.onDidLayoutChange(() => updateScrollbar());
   editor.onDidChangeCursorPosition(({ position }) => {
-    if (!syncing) updatePosition(position.lineNumber, position.column);
+    if (!syncing) {
+      updatePosition(position.lineNumber, position.column);
+      if (currentPath) {
+        writeLineCache(currentPath, {
+          line: viewTop,
+          column: position.column,
+        });
+      }
+    }
   });
 
   wireEditEvents();
