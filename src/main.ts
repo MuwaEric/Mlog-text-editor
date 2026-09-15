@@ -37,6 +37,7 @@ interface Prefs {
   bracketPairColorization: boolean;
   stickyScroll: boolean;
   matchCase: boolean;
+  readOnly: boolean;
   windowLines: number;
 }
 
@@ -55,6 +56,7 @@ const DEFAULT_PREFS: Prefs = {
   bracketPairColorization: false,
   stickyScroll: false,
   matchCase: false,
+  readOnly: false,
   windowLines: 4000,
 };
 
@@ -95,6 +97,7 @@ function applyPrefs() {
     fontLigatures: prefs.fontLigatures,
     cursorStyle: prefs.cursorStyle,
     wordWrap: prefs.wordWrap ? "on" : "off",
+    readOnly: prefs.readOnly,
     lineNumbers: prefs.lineNumbers
       ? (modelLine) => String(toFileLine(modelLine))
       : "off",
@@ -108,6 +111,7 @@ function applyPrefs() {
     detectIndentation: false,
   });
   editor.getModel()?.updateOptions({ tabSize: prefs.tabSize });
+  updateDocumentState();
 }
 
 interface FileMeta {
@@ -243,17 +247,24 @@ function updateDocumentState() {
   const gotoBtn = document.querySelector<HTMLButtonElement>("#goto-btn");
   const convertCrlf = document.querySelector<HTMLButtonElement>("#convert-crlf-btn");
   const convertLf = document.querySelector<HTMLButtonElement>("#convert-lf-btn");
+  const replaceBtn = document.querySelector<HTMLButtonElement>("#replace-btn");
+  const replaceAllBtn = document.querySelector<HTMLButtonElement>("#replace-all-btn");
   const name = document.querySelector<HTMLElement>("#file-name");
 
   const hasFile = Boolean(currentPath);
-  if (save) save.disabled = !hasFile || !dirty;
+  const isReadOnly = prefs.readOnly;
+
+  if (save) save.disabled = !hasFile || !dirty || isReadOnly;
   if (saveAs) saveAs.disabled = !hasFile;
   if (gotoBtn) gotoBtn.disabled = !hasFile;
-  if (convertCrlf) convertCrlf.disabled = !hasFile;
-  if (convertLf) convertLf.disabled = !hasFile;
+  if (convertCrlf) convertCrlf.disabled = !hasFile || isReadOnly;
+  if (convertLf) convertLf.disabled = !hasFile || isReadOnly;
+  if (replaceBtn) replaceBtn.disabled = !hasFile || isReadOnly;
+  if (replaceAllBtn) replaceAllBtn.disabled = !hasFile || isReadOnly;
   if (name) {
+    const readOnlyTag = isReadOnly ? " [Read-Only]" : "";
     name.textContent = hasFile
-      ? `${currentPath!.split("/").pop() ?? currentPath}${dirty ? " *" : ""}`
+      ? `${currentPath!.split("/").pop() ?? currentPath}${dirty ? " *" : ""}${readOnlyTag}`
       : "No file open";
   }
 }
@@ -611,7 +622,7 @@ async function openFile(path: string) {
  */
 function wireEditEvents() {
   editor.onDidChangeModelContent((e) => {
-    if (syncing) return;
+    if (syncing || prefs.readOnly) return;
 
     for (const change of e.changes) {
       const { range, text, rangeLength } = change;
@@ -705,13 +716,15 @@ function updateHitControls() {
       : "";
   }
   const hasHits = hits.length > 0;
+  const isReadOnly = prefs.readOnly;
   if (prev) prev.disabled = !hasHits;
   if (next) next.disabled = !hasHits;
-  if (replaceBtn) replaceBtn.disabled = !currentPath;
-  if (replaceAllBtn) replaceAllBtn.disabled = !currentPath;
+  if (replaceBtn) replaceBtn.disabled = !currentPath || isReadOnly;
+  if (replaceAllBtn) replaceAllBtn.disabled = !currentPath || isReadOnly;
 }
 
 async function replaceCurrentMatch() {
+  if (prefs.readOnly) return setStatus("Cannot replace: editor is in read-only mode");
   if (!currentPath) return setStatus("Open a file first");
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
   const query = searchInput?.value ?? "";
@@ -748,6 +761,7 @@ async function replaceCurrentMatch() {
 }
 
 async function replaceAllMatches() {
+  if (prefs.readOnly) return setStatus("Cannot replace: editor is in read-only mode");
   if (!currentPath) return setStatus("Open a file first");
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
   const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
@@ -850,9 +864,11 @@ function syncPrefControls() {
   );
   set("#pref-sticky-scroll", (el) => (el.checked = prefs.stickyScroll));
   set("#pref-match-case", (el) => (el.checked = prefs.matchCase));
+  set("#pref-read-only", (el) => (el.checked = prefs.readOnly));
   set("#pref-window-lines", (el) => (el.value = String(prefs.windowLines)));
   set("#word-wrap", (el) => (el.checked = prefs.wordWrap));
   set("#match-case", (el) => (el.checked = prefs.matchCase));
+  set("#read-only", (el) => (el.checked = prefs.readOnly));
 }
 
 /** Applies a preference change everywhere and persists it. */
@@ -913,7 +929,9 @@ function wirePreferences() {
   bindCheckbox("#pref-sticky-scroll", "stickyScroll");
   bindCheckbox("#pref-ligatures", "fontLigatures");
   bindCheckbox("#pref-match-case", "matchCase");
+  bindCheckbox("#pref-read-only", "readOnly");
   bindCheckbox("#word-wrap", "wordWrap");
+  bindCheckbox("#read-only", "readOnly");
 
   const bindNumber = (
     id: string,

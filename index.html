@@ -48,6 +48,11 @@
       </details>
       <span id="file-name" title="Current document">No file open</span>
       <label class="switch">
+        <input type="checkbox" id="read-only" />
+        <span class="switch-track"><span class="switch-knob"></span></span>
+        <span class="switch-text">Read-only</span>
+      </label>
+      <label class="switch">
         <input type="checkbox" id="word-wrap" />
         <span class="switch-track"><span class="switch-knob"></span></span>
         <span class="switch-text">Wrap</span>
@@ -175,6 +180,11 @@
         <label class="pref-row">
           <span>Search is case-sensitive by default</span>
           <input type="checkbox" id="pref-match-case" />
+        </label>
+
+        <label class="pref-row">
+          <span>Read-only mode</span>
+          <input type="checkbox" id="pref-read-only" />
         </label>
 
         <label class="pref-row">
