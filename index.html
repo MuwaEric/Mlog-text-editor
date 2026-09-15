@@ -5,13 +5,13 @@
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Giant File Editor</title>
-    <script type="module" src="/src/main.ts" defer></script>
+    <script type="module" src="/src/main.ts"></script>
   </head>
 
   <body>
     <div id="toolbar">
-      <details id="actions-menu">
-        <summary title="Application menu">☰</summary>
+      <details id="actions-menu" class="actions-menu">
+        <summary id="menu-summary" title="Application menu">☰</summary>
         <div class="actions-list">
           <button id="open-btn" class="menu-item" type="button" title="Open File (Ctrl+O)">
             <span class="menu-icon">↗</span><span>Open File…</span><span class="menu-shortcut">Ctrl+O</span>
@@ -20,7 +20,7 @@
           <button id="save-btn" class="menu-item" type="button" disabled title="Save (Ctrl+S)">
             <span class="menu-icon">↓</span><span>Save</span><span class="menu-shortcut">Ctrl+S</span>
           </button>
-          <button id="save-as-btn" class="menu-item" type="button" title="Save As (Ctrl+Shift+S)">
+          <button id="save-as-btn" class="menu-item" type="button" disabled title="Save As (Ctrl+Shift+S)">
             <span class="menu-icon">⇩</span><span>Save As…</span><span class="menu-shortcut">Ctrl+Shift+S</span>
           </button>
           <div class="menu-separator"></div>
@@ -30,8 +30,15 @@
           <button id="redo-btn" class="menu-item" type="button" disabled title="Redo (Ctrl+Y)">
             <span class="menu-icon">↷</span><span>Redo</span><span class="menu-shortcut">Ctrl+Y</span>
           </button>
-          <button id="goto-btn" class="menu-item" type="button" title="Go To line or byte (Ctrl+G)">
+          <button id="goto-btn" class="menu-item" type="button" disabled title="Go To line or byte (Ctrl+G)">
             <span class="menu-icon">⌖</span><span>Go To…</span><span class="menu-shortcut">Ctrl+G</span>
+          </button>
+          <div class="menu-separator"></div>
+          <button id="convert-crlf-btn" class="menu-item" type="button" disabled title="Convert line endings to CRLF (Windows)">
+            <span class="menu-icon">↵</span><span>Convert to CRLF</span><span class="menu-shortcut"></span>
+          </button>
+          <button id="convert-lf-btn" class="menu-item" type="button" disabled title="Convert line endings to LF (Unix/Linux)">
+            <span class="menu-icon">↓</span><span>Convert to LF</span><span class="menu-shortcut"></span>
           </button>
           <div class="menu-separator"></div>
           <button id="prefs-btn" class="menu-item" type="button" title="Preferences">

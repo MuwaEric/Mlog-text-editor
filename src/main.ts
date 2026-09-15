@@ -113,6 +113,7 @@ function applyPrefs() {
 interface FileMeta {
   total_lines: number;
   size_bytes: number;
+  newline: string;
 }
 
 interface SearchHit {
@@ -238,9 +239,23 @@ function setStatus(message: string) {
 
 function updateDocumentState() {
   const save = document.querySelector<HTMLButtonElement>("#save-btn");
+  const saveAs = document.querySelector<HTMLButtonElement>("#save-as-btn");
+  const gotoBtn = document.querySelector<HTMLButtonElement>("#goto-btn");
+  const convertCrlf = document.querySelector<HTMLButtonElement>("#convert-crlf-btn");
+  const convertLf = document.querySelector<HTMLButtonElement>("#convert-lf-btn");
   const name = document.querySelector<HTMLElement>("#file-name");
-  if (save) save.disabled = !currentPath || !dirty;
-  if (name && currentPath) name.textContent = `${currentPath.split("/").pop() ?? currentPath}${dirty ? " *" : ""}`;
+
+  const hasFile = Boolean(currentPath);
+  if (save) save.disabled = !hasFile || !dirty;
+  if (saveAs) saveAs.disabled = !hasFile;
+  if (gotoBtn) gotoBtn.disabled = !hasFile;
+  if (convertCrlf) convertCrlf.disabled = !hasFile;
+  if (convertLf) convertLf.disabled = !hasFile;
+  if (name) {
+    name.textContent = hasFile
+      ? `${currentPath!.split("/").pop() ?? currentPath}${dirty ? " *" : ""}`
+      : "No file open";
+  }
 }
 
 function updateHistoryControls() {
@@ -263,7 +278,24 @@ async function saveDocument(path: string | null = currentPath) {
   dirty = false;
   clearRecoveryState();
   updateDocumentState();
-  setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes saved`);
+  setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} saved`);
+}
+
+async function convertLineEndingsTo(target: "LF" | "CRLF") {
+  if (!currentPath) {
+    return setStatus("No file open to convert line endings");
+  }
+  setStatus(`Converting line endings to ${target}…`);
+  await pendingEdits;
+  const meta = await invoke<FileMeta>("convert_line_endings", { targetFormat: target });
+  totalLines = meta.total_lines;
+  dirty = true;
+  updateDocumentState();
+  persistRecoveryState();
+  await anchorWindow(viewTop);
+  scrollToViewTop();
+  updateScrollbar();
+  setStatus(`Converted line endings to ${meta.newline} (${meta.total_lines.toLocaleString()} lines)`);
 }
 
 function wireExternalChangeDialog() {
@@ -380,6 +412,7 @@ function updatePosition(modelLine: number, column: number) {
   if (!position) return;
   const fileLine = toFileLine(modelLine);
   position.textContent = `Ln ${fileLine.toLocaleString()}, Col ${column.toLocaleString()}`;
+  if (!currentPath) return;
   const requestId = ++positionRequestId;
   void invoke<number>("byte_offset", { line: fileLine, column })
     .then((offset) => {
@@ -416,6 +449,7 @@ function maxViewTop(): number {
 
 /** Loads a fresh window of lines into the model, starting at `start`. */
 async function anchorWindow(start: number) {
+  if (!currentPath) return;
   const maxStart = Math.max(1, totalLines - windowLines() + 1);
   const newStart = Math.min(Math.max(1, Math.round(start)), maxStart);
   const end = Math.min(newStart + windowLines() - 1, totalLines);
@@ -563,7 +597,7 @@ async function openFile(path: string) {
   await anchorWindow(1);
   scrollToViewTop();
   updateScrollbar();
-  const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes`;
+  const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline}`;
   setStatus(
     hasUnsavedRecovery
       ? `${baseStatus} (⚠️ previous session had unsaved changes)`
@@ -616,6 +650,7 @@ function wireEditEvents() {
 }
 
 async function runSearch(query: string) {
+  if (!currentPath) return setStatus("Open a file to search");
   if (!query) return;
   const requestId = ++searchRequestId;
   activeSearchRequestId = requestId;
@@ -672,12 +707,21 @@ function updateHitControls() {
   const hasHits = hits.length > 0;
   if (prev) prev.disabled = !hasHits;
   if (next) next.disabled = !hasHits;
-  if (replaceBtn) replaceBtn.disabled = hitIndex < 0 || hitIndex >= hits.length;
-  if (replaceAllBtn) replaceAllBtn.disabled = !hasHits;
+  if (replaceBtn) replaceBtn.disabled = !currentPath;
+  if (replaceAllBtn) replaceAllBtn.disabled = !currentPath;
 }
 
 async function replaceCurrentMatch() {
-  if (hitIndex < 0 || hitIndex >= hits.length) return;
+  if (!currentPath) return setStatus("Open a file first");
+  const searchInput = document.querySelector<HTMLInputElement>("#search-input");
+  const query = searchInput?.value ?? "";
+  if (!query) return setStatus("Enter search text to replace");
+
+  if (hitIndex < 0 || hitIndex >= hits.length) {
+    await runSearch(query);
+    if (hits.length === 0) return setStatus("No matches found to replace");
+  }
+
   const hit = hits[hitIndex];
   const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
   const replacement = replaceInput?.value ?? "";
@@ -704,10 +748,11 @@ async function replaceCurrentMatch() {
 }
 
 async function replaceAllMatches() {
+  if (!currentPath) return setStatus("Open a file first");
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
   const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
   const query = searchInput?.value ?? "";
-  if (!query) return;
+  if (!query) return setStatus("Enter search text to replace all");
   const replacement = replaceInput?.value ?? "";
 
   const matchCase =
@@ -826,19 +871,15 @@ async function updatePref<K extends keyof Prefs>(key: K, value: Prefs[K]) {
   updateScrollbar();
 }
 
+function openPreferencesDialog() {
+  syncPrefControls();
+  document.querySelector<HTMLElement>("#prefs-overlay")?.removeAttribute("hidden");
+}
+
 function wirePreferences() {
   const overlay = document.querySelector<HTMLElement>("#prefs-overlay");
-  const open = () => {
-    syncPrefControls();
-    overlay?.removeAttribute("hidden");
-  };
   const close = () => overlay?.setAttribute("hidden", "");
 
-  document.querySelector("#prefs-btn")?.addEventListener("click", () => {
-    const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
-    if (actionsMenu) actionsMenu.open = false;
-    open();
-  });
   document.querySelector("#prefs-close")?.addEventListener("click", close);
   overlay?.addEventListener("click", (e) => {
     if (e.target === overlay) close();
@@ -914,13 +955,14 @@ function wirePreferences() {
     });
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+function initApp() {
   const container = document.querySelector<HTMLDivElement>("#editor-container");
   if (!container) return;
 
   const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
+
   const closeActionsMenu = () => {
-    if (actionsMenu && actionsMenu.open) actionsMenu.open = false;
+    if (actionsMenu) actionsMenu.open = false;
   };
 
   const chooseFile = () => {
@@ -932,22 +974,33 @@ window.addEventListener("DOMContentLoaded", () => {
         directory: false,
         title: "Open a text file",
       });
-      if (typeof selected === "string") await openFile(selected);
+      if (typeof selected === "string") {
+        await openFile(selected);
+      } else {
+        setStatus(currentPath ? "" : "No file open");
+      }
     })().catch((err) => setStatus(`Open failed: ${err}`));
   };
+
+  const openPreferences = () => {
+    closeActionsMenu();
+    openPreferencesDialog();
+  };
+
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
+  document.querySelector("#prefs-btn")?.addEventListener("click", openPreferences);
   wirePreferences();
   wireGotoDialog();
   wireExternalChangeDialog();
 
-  window.addEventListener("pointerdown", (event) => {
+  window.addEventListener("click", (event) => {
     if (actionsMenu?.open && !actionsMenu.contains(event.target as Node)) {
       actionsMenu.open = false;
     }
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      if (actionsMenu?.open) actionsMenu.open = false;
+    if (event.key === "Escape" && actionsMenu?.open) {
+      actionsMenu.open = false;
     }
   });
 
@@ -985,6 +1038,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   wireEditEvents();
   wireScrollbar();
+  updateDocumentState();
   updateHistoryControls();
 
   document.querySelector("#save-btn")?.addEventListener("click", () => {
@@ -998,6 +1052,14 @@ window.addEventListener("DOMContentLoaded", () => {
   document.querySelector("#goto-btn")?.addEventListener("click", () => {
     closeActionsMenu();
     goToPosition();
+  });
+  document.querySelector("#convert-crlf-btn")?.addEventListener("click", () => {
+    closeActionsMenu();
+    void convertLineEndingsTo("CRLF").catch((error) => setStatus(`Conversion failed: ${error}`));
+  });
+  document.querySelector("#convert-lf-btn")?.addEventListener("click", () => {
+    closeActionsMenu();
+    void convertLineEndingsTo("LF").catch((error) => setStatus(`Conversion failed: ${error}`));
   });
   document.querySelector("#undo-btn")?.addEventListener("click", () => {
     closeActionsMenu();
@@ -1191,4 +1253,10 @@ window.addEventListener("DOMContentLoaded", () => {
   void invoke<string | null>("startup_path")
     .then((path) => (path ? openFile(path) : undefined))
     .catch((err) => setStatus(`Open failed: ${err}`));
-});
+}
+
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", initApp);
+} else {
+  initApp();
+}

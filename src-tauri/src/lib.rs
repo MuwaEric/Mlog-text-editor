@@ -609,6 +609,7 @@ struct AppState {
 struct FileMeta {
     total_lines: usize,
     size_bytes: usize,
+    newline: String,
 }
 
 /// 1-based line and UTF-16 column, i.e. directly usable as a Monaco `IPosition`. The end pair
@@ -676,6 +677,17 @@ fn get_file_mtime_ms(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn detect_newline_format(bytes: &[u8]) -> String {
+    let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
+    if has_crlf {
+        "CRLF".to_string()
+    } else if bytes.iter().any(|&b| b == b'\r') {
+        "CR".to_string()
+    } else {
+        "LF".to_string()
+    }
+}
+
 /// Opens `path` with `mmap` and scans it for line breaks on a background task, then stores the
 /// resulting Piece Table in app state.
 #[tauri::command]
@@ -688,11 +700,14 @@ async fn open_file(
     let open_path = path.clone();
     let mtime = get_file_mtime_ms(&open_path);
 
-    let table = tauri::async_runtime::spawn_blocking(move || -> Result<PieceTable, String> {
+    let (table, newline_format) = tauri::async_runtime::spawn_blocking(move || -> Result<(PieceTable, String), String> {
         let file = File::open(&path).map_err(|e| e.to_string())?;
         // SAFETY: as with any mmap, behaviour is undefined if another process truncates the
         // file while it is mapped. That is the standard, unavoidable caveat of this approach.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+
+        let sample_len = mmap.len().min(64 * 1024);
+        let newline_format = detect_newline_format(&mmap[..sample_len]);
 
         let total_bytes = mmap.len();
         let newlines = scan_newlines(&mmap, |scanned| {
@@ -704,7 +719,7 @@ async fn open_file(
                 },
             );
         });
-        Ok(PieceTable::new(Arc::new(mmap), Arc::new(newlines)))
+        Ok((PieceTable::new(Arc::new(mmap), Arc::new(newlines)), newline_format))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -712,6 +727,7 @@ async fn open_file(
     let meta = FileMeta {
         total_lines: table.total_lines(),
         size_bytes: table.total_length(),
+        newline: newline_format,
     };
     *inner.lock().map_err(|e| e.to_string())? = Some(table);
     *state.path.lock().map_err(|e| e.to_string())? = Some(PathBuf::from(open_path));
@@ -749,7 +765,12 @@ async fn save_file(
                 }
                 output.sync_all().map_err(|e| e.to_string())?;
                 fs::rename(&temporary, &target).map_err(|e| e.to_string())?;
-                Ok(FileMeta { total_lines: table.total_lines(), size_bytes: table.total_length() })
+                let sample = table.get_bytes_range(0, table.total_length().min(64 * 1024));
+                Ok(FileMeta {
+                    total_lines: table.total_lines(),
+                    size_bytes: table.total_length(),
+                    newline: detect_newline_format(&sample),
+                })
             })();
             if result.is_err() { let _ = fs::remove_file(&temporary); }
             result
@@ -1018,6 +1039,38 @@ async fn replace_all(
     .await
 }
 
+/// Converts line endings across the piece table to either LF or CRLF.
+#[tauri::command]
+async fn convert_line_endings(
+    state: State<'_, AppState>,
+    target_format: String,
+) -> Result<FileMeta, String> {
+    with_table(&state, move |table| {
+        let total = table.total_length();
+        let bytes = table.get_bytes_range(0, total);
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+
+        if target_format.eq_ignore_ascii_case("LF") {
+            text = text.replace("\r\n", "\n").replace('\r', "\n");
+        } else if target_format.eq_ignore_ascii_case("CRLF") {
+            text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n");
+        }
+
+        if total > 0 {
+            table.delete_text(0, total);
+        }
+        table.insert_text(0, &text);
+
+        let sample = table.get_bytes_range(0, table.total_length().min(64 * 1024));
+        FileMeta {
+            total_lines: table.total_lines(),
+            size_bytes: table.total_length(),
+            newline: detect_newline_format(&sample),
+        }
+    })
+    .await
+}
+
 /// Path given on the command line, so `giant-file-editor foo.txt` works.
 #[tauri::command]
 fn startup_path() -> Option<String> {
@@ -1042,6 +1095,7 @@ pub fn run() {
             replace_match,
             replace_all,
             check_file_changed,
+            convert_line_endings,
             startup_path
         ])
         .run(tauri::generate_context!())
@@ -1210,5 +1264,31 @@ mod tests {
             "the quick bright blue fox jumps over the bright blue dog\n"
         );
         assert_eq!(t.total_lines(), 2);
+    }
+
+    #[test]
+    fn convert_line_endings_between_lf_and_crlf() {
+        let mut t = table("line 1\nline 2\nline 3\n");
+        assert_eq!(detect_newline_format(whole(&t).as_bytes()), "LF");
+
+        // Convert to CRLF
+        let total = t.total_length();
+        let bytes = t.get_bytes_range(0, total);
+        let crlf_text = String::from_utf8_lossy(&bytes).replace('\n', "\r\n");
+        t.delete_text(0, total);
+        t.insert_text(0, &crlf_text);
+
+        assert_eq!(detect_newline_format(whole(&t).as_bytes()), "CRLF");
+        assert_eq!(whole(&t), "line 1\r\nline 2\r\nline 3\r\n");
+
+        // Convert back to LF
+        let total2 = t.total_length();
+        let bytes2 = t.get_bytes_range(0, total2);
+        let lf_text = String::from_utf8_lossy(&bytes2).replace("\r\n", "\n");
+        t.delete_text(0, total2);
+        t.insert_text(0, &lf_text);
+
+        assert_eq!(detect_newline_format(whole(&t).as_bytes()), "LF");
+        assert_eq!(whole(&t), "line 1\nline 2\nline 3\n");
     }
 }
