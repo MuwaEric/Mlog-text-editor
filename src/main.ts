@@ -161,6 +161,41 @@ let positionRequestId = 0;
 let currentPath: string | null = null;
 let dirty = false;
 
+const RECOVERY_KEY = "gfe.recovery";
+
+interface RecoveryRecord {
+  path: string;
+  timestamp: number;
+}
+
+function persistRecoveryState() {
+  if (!currentPath || !dirty) return;
+  try {
+    const record: RecoveryRecord = {
+      path: currentPath,
+      timestamp: Date.now(),
+    };
+    localStorage.setItem(RECOVERY_KEY, JSON.stringify(record));
+  } catch {}
+}
+
+function clearRecoveryState() {
+  try {
+    localStorage.removeItem(RECOVERY_KEY);
+  } catch {}
+}
+
+function checkRecoveryState(path: string): boolean {
+  try {
+    const raw = localStorage.getItem(RECOVERY_KEY);
+    if (!raw) return false;
+    const record = JSON.parse(raw) as RecoveryRecord;
+    return record.path === path;
+  } catch {
+    return false;
+  }
+}
+
 const toFileLine = (modelLine: number) => windowStart + modelLine - 1;
 const toModelLine = (fileLine: number) => fileLine - windowStart + 1;
 
@@ -226,7 +261,7 @@ async function saveDocument(path: string | null = currentPath) {
   const meta = await invoke<FileMeta>("save_file", { path });
   currentPath = path;
   dirty = false;
-  try { localStorage.removeItem("gfe.recovery"); } catch {}
+  clearRecoveryState();
   updateDocumentState();
   setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes saved`);
 }
@@ -425,6 +460,7 @@ async function openFile(path: string) {
   windowCount = 0;
   viewTop = 1;
 
+  const hasUnsavedRecovery = checkRecoveryState(path);
   const nameEl = document.querySelector<HTMLElement>("#file-name");
   if (nameEl) nameEl.textContent = path.split("/").pop() ?? path;
   currentPath = path;
@@ -439,8 +475,11 @@ async function openFile(path: string) {
   await anchorWindow(1);
   scrollToViewTop();
   updateScrollbar();
+  const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes`;
   setStatus(
-    `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes`
+    hasUnsavedRecovery
+      ? `${baseStatus} (⚠️ previous session had unsaved changes)`
+      : baseStatus
   );
 }
 
@@ -484,7 +523,7 @@ function wireEditEvents() {
     dirty = true;
     updateDocumentState();
     updateHistoryControls();
-    try { localStorage.setItem("gfe.recovery", JSON.stringify({ path: currentPath, dirty: true })); } catch {}
+    persistRecoveryState();
   });
 }
 
@@ -906,6 +945,13 @@ window.addEventListener("DOMContentLoaded", () => {
   regexBox?.addEventListener("change", () => {
     lastQuery = null;
   });
+
+  window.addEventListener("beforeunload", () => {
+    if (dirty) persistRecoveryState();
+  });
+  setInterval(() => {
+    if (dirty) persistRecoveryState();
+  }, 5000);
 
   void invoke<string | null>("startup_path")
     .then((path) => (path ? openFile(path) : undefined))
