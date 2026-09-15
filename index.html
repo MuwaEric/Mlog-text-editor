@@ -51,30 +51,37 @@
       <div id="vscroll"><div id="vthumb"></div></div>
     </div>
     <div id="findbar">
-      <input id="search-input" placeholder="Find in file…" />
-      <button id="search-btn">Search</button>
-      <button id="prev-hit" title="Previous match (Shift+Enter)" disabled>
-        ▲
-      </button>
-      <button id="next-hit" title="Next match (Enter)" disabled>▼</button>
-      <span id="hit-counter"></span>
-      <label class="switch">
-        <input type="checkbox" id="match-case" />
-        <span class="switch-track"><span class="switch-knob"></span></span>
-        <span class="switch-text">Match case</span>
-      </label>
-      <label class="switch">
-        <input type="checkbox" id="whole-word" />
-        <span class="switch-track"><span class="switch-knob"></span></span>
-        <span class="switch-text">Whole word</span>
-      </label>
-      <label class="switch">
-        <input type="checkbox" id="regex-search" />
-        <span class="switch-track"><span class="switch-knob"></span></span>
-        <span class="switch-text">Regex</span>
-      </label>
-      <span id="position" aria-live="polite">Ln 1, Col 1</span>
-      <span id="status"></span>
+      <div class="find-row">
+        <input id="search-input" placeholder="Find in file…" />
+        <button id="search-btn">Search</button>
+        <button id="prev-hit" title="Previous match (Shift+Enter)" disabled>
+          ▲
+        </button>
+        <button id="next-hit" title="Next match (Enter)" disabled>▼</button>
+        <span id="hit-counter"></span>
+        <label class="switch">
+          <input type="checkbox" id="match-case" />
+          <span class="switch-track"><span class="switch-knob"></span></span>
+          <span class="switch-text">Match case</span>
+        </label>
+        <label class="switch">
+          <input type="checkbox" id="whole-word" />
+          <span class="switch-track"><span class="switch-knob"></span></span>
+          <span class="switch-text">Whole word</span>
+        </label>
+        <label class="switch">
+          <input type="checkbox" id="regex-search" />
+          <span class="switch-track"><span class="switch-knob"></span></span>
+          <span class="switch-text">Regex</span>
+        </label>
+        <span id="position" aria-live="polite">Ln 1, Col 1</span>
+        <span id="status"></span>
+      </div>
+      <div id="replace-row" class="find-row">
+        <input id="replace-input" placeholder="Replace with…" />
+        <button id="replace-btn" title="Replace current match" disabled>Replace</button>
+        <button id="replace-all-btn" title="Replace all occurrences in document" disabled>Replace All</button>
+      </div>
     </div>
 
     <div id="prefs-overlay" hidden>
@@ -182,6 +189,20 @@
         <div class="pref-actions">
           <button id="prefs-reset">Reset to defaults</button>
           <button id="prefs-close">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="goto-overlay" hidden>
+      <div id="goto-panel" role="dialog" aria-label="Go to line or position">
+        <h2>Go to Position</h2>
+        <p class="pref-hint" style="margin-bottom: 0.8em;">
+          Enter a line number (e.g. <code>1250</code>), line & column (e.g. <code>1250:15</code>), or byte offset (e.g. <code>byte:500000</code>).
+        </p>
+        <input id="goto-input" type="text" placeholder="1250 or 1250:15 or byte:500000" style="width: 100%; box-sizing: border-box; padding: 0.5em; margin-bottom: 1em;" />
+        <div class="pref-actions">
+          <button id="goto-submit-btn">Go</button>
+          <button id="goto-close-btn">Cancel</button>
         </div>
       </div>
     </div>

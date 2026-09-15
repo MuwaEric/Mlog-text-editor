@@ -434,6 +434,7 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec
 ///     primary region, and reports only matches that *start* in the primary region;
 ///   * piece boundaries — a small window around each one is re-scanned for matches that
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
+#[allow(dead_code)]
 fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
     search_document_with_progress(table, pattern, fold_case, false, None, 0)
 }
@@ -625,6 +626,12 @@ struct SearchResult {
     total_matches: usize,
     truncated: bool,
     hits: Vec<SearchHit>,
+}
+
+#[derive(Serialize, Clone)]
+struct ReplaceAllResult {
+    replaced_count: usize,
+    total_lines: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -885,6 +892,101 @@ async fn search_text(
     .await
 }
 
+/// Replaces a single match range and returns the new document line count.
+#[tauri::command]
+async fn replace_match(
+    state: State<'_, AppState>,
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+    text: String,
+) -> Result<usize, String> {
+    with_table(&state, move |table| {
+        let start = table.offset_of_position(start_line, start_column);
+        let end = table.offset_of_position(end_line, end_column);
+        let len = end.saturating_sub(start);
+        if len > 0 {
+            table.delete_text(start, len);
+        }
+        if !text.is_empty() {
+            table.insert_text(start, &text);
+        }
+        table.total_lines()
+    })
+    .await
+}
+
+/// Replaces all occurrences across the entire document piece table in reverse order.
+#[tauri::command]
+async fn replace_all(
+    state: State<'_, AppState>,
+    query: String,
+    replacement: String,
+    match_case: bool,
+    whole_word: bool,
+    regex: bool,
+) -> Result<ReplaceAllResult, String> {
+    if query.is_empty() {
+        return Err("search query cannot be empty".to_string());
+    }
+    let regex_engine = if regex {
+        Some(
+            RegexBuilder::new(&query)
+                .case_insensitive(!match_case)
+                .unicode(false)
+                .build()
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+
+    with_table(&state, move |table| {
+        let matches: Vec<(usize, usize)> = if regex {
+            search_regex_document(
+                table,
+                regex_engine.as_ref().expect("regex engine is present"),
+                whole_word,
+            )
+        } else {
+            let pattern = if match_case {
+                query.as_bytes().to_vec()
+            } else {
+                fold_bytes(query.as_bytes())
+            };
+            search_document_with_progress(
+                table,
+                &pattern,
+                !match_case,
+                whole_word,
+                None,
+                0,
+            )
+            .into_iter()
+            .map(|offset| (offset, pattern.len()))
+            .collect()
+        };
+
+        let replaced_count = matches.len();
+        // Splicing in reverse order preserves byte offsets of earlier matches.
+        for &(offset, length) in matches.iter().rev() {
+            if length > 0 {
+                table.delete_text(offset, length);
+            }
+            if !replacement.is_empty() {
+                table.insert_text(offset, &replacement);
+            }
+        }
+
+        ReplaceAllResult {
+            replaced_count,
+            total_lines: table.total_lines(),
+        }
+    })
+    .await
+}
+
 /// Path given on the command line, so `giant-file-editor foo.txt` works.
 #[tauri::command]
 fn startup_path() -> Option<String> {
@@ -906,6 +1008,8 @@ pub fn run() {
             byte_offset,
             position_at_byte,
             search_text,
+            replace_match,
+            replace_all,
             startup_path
         ])
         .run(tauri::generate_context!())
@@ -1051,5 +1155,28 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(search_regex_document(&t, &regex, true), vec![(0, 5), (15, 5)]);
+    }
+
+    #[test]
+    fn replace_all_in_reverse_order_updates_piece_table() {
+        let mut t = table("the quick red fox jumps over the red dog\n");
+        let pattern = b"red";
+        let matches: Vec<(usize, usize)> = search_document(&t, pattern, false)
+            .into_iter()
+            .map(|offset| (offset, pattern.len()))
+            .collect();
+        assert_eq!(matches, vec![(10, 3), (33, 3)]);
+
+        let replacement = "bright blue";
+        for &(offset, length) in matches.iter().rev() {
+            t.delete_text(offset, length);
+            t.insert_text(offset, replacement);
+        }
+
+        assert_eq!(
+            whole(&t),
+            "the quick bright blue fox jumps over the bright blue dog\n"
+        );
+        assert_eq!(t.total_lines(), 2);
     }
 }

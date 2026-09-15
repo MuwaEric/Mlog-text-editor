@@ -34,9 +34,6 @@ body {
 
 #toolbar,
 #findbar {
-  display: flex;
-  align-items: center;
-  gap: 0.6em;
   padding: 0.45em 0.6em;
   background: #1e1e1e;
   color: #eee;
@@ -44,18 +41,32 @@ body {
 }
 
 #toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
   position: relative;
   z-index: 10;
   border-bottom: 1px solid #000;
 }
 
 #findbar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
   border-top: 1px solid #000;
+}
+
+.find-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  width: 100%;
 }
 
 #toolbar input,
 #findbar input[type="text"],
-#search-input {
+#search-input,
+#replace-input {
   padding: 0.3em 0.5em;
   border: 1px solid #ffffff26;
   border-radius: 4px;
@@ -63,12 +74,14 @@ body {
   color: #eee;
 }
 
-#search-input {
+#search-input,
+#replace-input {
   flex: 0 1 26em;
   min-width: 8em;
 }
 
-#search-input::placeholder {
+#search-input::placeholder,
+#replace-input::placeholder {
   color: #ffffff66;
 }
 
@@ -277,11 +290,13 @@ body {
   line-height: 1;
 }
 
-#prefs-overlay[hidden] {
+#prefs-overlay[hidden],
+#goto-overlay[hidden] {
   display: none;
 }
 
-#prefs-overlay {
+#prefs-overlay,
+#goto-overlay {
   position: fixed;
   inset: 0;
   background: #00000066;
@@ -291,7 +306,8 @@ body {
   z-index: 100;
 }
 
-#prefs-panel {
+#prefs-panel,
+#goto-panel {
   background: #fff;
   color: #0f0f0f;
   border-radius: 8px;
@@ -303,7 +319,8 @@ body {
   box-shadow: 0 8px 32px #00000055;
 }
 
-#prefs-panel h2 {
+#prefs-panel h2,
+#goto-panel h2 {
   margin: 0 0 0.75em;
   font-size: 1.1em;
 }

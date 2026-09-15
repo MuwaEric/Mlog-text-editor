@@ -266,25 +266,70 @@ async function saveDocument(path: string | null = currentPath) {
   setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes saved`);
 }
 
-async function goToPosition() {
-  const value = window.prompt("Enter a line, line:column, or byte offset (prefix byte:):");
-  if (!value) return;
-  if (value.startsWith("byte:")) {
-    const offset = Number(value.slice(5).trim());
-    if (!Number.isSafeInteger(offset) || offset < 0) return setStatus("Invalid byte offset");
-    const [line, column] = await invoke<[number, number]>("position_at_byte", { offset });
-    await goToLine(line);
-    editor.setPosition({ lineNumber: toModelLine(line), column });
-    return;
+function wireGotoDialog() {
+  const overlay = document.querySelector<HTMLElement>("#goto-overlay");
+  const input = document.querySelector<HTMLInputElement>("#goto-input");
+  const submitBtn = document.querySelector<HTMLButtonElement>("#goto-submit-btn");
+  const closeBtn = document.querySelector<HTMLButtonElement>("#goto-close-btn");
+
+  const close = () => {
+    overlay?.setAttribute("hidden", "");
+    editor?.focus();
+  };
+
+  const submit = () => {
+    const value = input?.value.trim();
+    if (!value) return close();
+    void (async () => {
+      if (value.startsWith("byte:")) {
+        const offset = Number(value.slice(5).trim());
+        if (!Number.isSafeInteger(offset) || offset < 0) return setStatus("Invalid byte offset");
+        const [line, column] = await invoke<[number, number]>("position_at_byte", { offset });
+        await goToLine(line);
+        editor.setPosition({ lineNumber: toModelLine(line), column });
+        close();
+        return;
+      }
+      const parts = value.split(":").map(Number);
+      const line = parts[0];
+      const column = parts.length > 1 ? parts[1] : 1;
+      if (!Number.isSafeInteger(line) || line < 1 || !Number.isSafeInteger(column) || column < 1) {
+        return setStatus("Invalid line or column");
+      }
+      await goToLine(line);
+      editor.setPosition({ lineNumber: toModelLine(line), column });
+      close();
+    })().catch((err) => setStatus(`Navigation failed: ${err}`));
+  };
+
+  submitBtn?.addEventListener("click", submit);
+  closeBtn?.addEventListener("click", close);
+  overlay?.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  input?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  });
+}
+
+function openGotoDialog() {
+  const overlay = document.querySelector<HTMLElement>("#goto-overlay");
+  const input = document.querySelector<HTMLInputElement>("#goto-input");
+  if (overlay && input) {
+    overlay.removeAttribute("hidden");
+    input.value = "";
+    input.focus();
   }
-  const parts = value.split(":").map(Number);
-  const line = parts[0];
-  const column = parts.length > 1 ? parts[1] : 1;
-  if (!Number.isSafeInteger(line) || line < 1 || !Number.isSafeInteger(column) || column < 1) {
-    return setStatus("Invalid line or column");
-  }
-  await goToLine(line);
-  editor.setPosition({ lineNumber: toModelLine(line), column });
+}
+
+function goToPosition() {
+  openGotoDialog();
 }
 
 function updatePosition(modelLine: number, column: number) {
@@ -574,13 +619,87 @@ function updateHitControls() {
   const counter = document.querySelector<HTMLElement>("#hit-counter");
   const prev = document.querySelector<HTMLButtonElement>("#prev-hit");
   const next = document.querySelector<HTMLButtonElement>("#next-hit");
+  const replaceBtn = document.querySelector<HTMLButtonElement>("#replace-btn");
+  const replaceAllBtn = document.querySelector<HTMLButtonElement>("#replace-all-btn");
   if (counter) {
     counter.textContent = hits.length
       ? `${hitIndex + 1}/${hits.length}${hitsTruncated ? "+" : ""}`
       : "";
   }
-  if (prev) prev.disabled = hits.length === 0;
-  if (next) next.disabled = hits.length === 0;
+  const hasHits = hits.length > 0;
+  if (prev) prev.disabled = !hasHits;
+  if (next) next.disabled = !hasHits;
+  if (replaceBtn) replaceBtn.disabled = hitIndex < 0 || hitIndex >= hits.length;
+  if (replaceAllBtn) replaceAllBtn.disabled = !hasHits;
+}
+
+async function replaceCurrentMatch() {
+  if (hitIndex < 0 || hitIndex >= hits.length) return;
+  const hit = hits[hitIndex];
+  const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
+  const replacement = replaceInput?.value ?? "";
+
+  await pendingEdits;
+  totalLines = await invoke<number>("replace_match", {
+    startLine: hit.line,
+    startColumn: hit.column,
+    endLine: hit.end_line,
+    endColumn: hit.end_column,
+    text: replacement,
+  });
+
+  dirty = true;
+  updateDocumentState();
+  persistRecoveryState();
+  await anchorWindow(viewTop);
+  scrollToViewTop();
+  updateScrollbar();
+
+  if (lastQuery) {
+    await runSearch(lastQuery);
+  }
+}
+
+async function replaceAllMatches() {
+  const searchInput = document.querySelector<HTMLInputElement>("#search-input");
+  const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
+  const query = searchInput?.value ?? "";
+  if (!query) return;
+  const replacement = replaceInput?.value ?? "";
+
+  const matchCase =
+    document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
+  const wholeWord =
+    document.querySelector<HTMLInputElement>("#whole-word")?.checked ?? false;
+  const regex =
+    document.querySelector<HTMLInputElement>("#regex-search")?.checked ?? false;
+
+  await pendingEdits;
+  setStatus("Replacing all occurrences…");
+  const result = await invoke<{ replaced_count: number; total_lines: number }>(
+    "replace_all",
+    {
+      query,
+      replacement,
+      matchCase,
+      wholeWord,
+      regex,
+    }
+  );
+
+  totalLines = result.total_lines;
+  dirty = true;
+  updateDocumentState();
+  persistRecoveryState();
+  await anchorWindow(viewTop);
+  scrollToViewTop();
+  updateScrollbar();
+  setStatus(`Replaced ${result.replaced_count.toLocaleString()} occurrence(s)`);
+
+  hits = [];
+  hitIndex = -1;
+  updateSearchDecorations();
+  updateHitControls();
 }
 
 /** Centres the given match in the viewport and selects it. Wraps around at either end. */
@@ -672,7 +791,11 @@ function wirePreferences() {
   };
   const close = () => overlay?.setAttribute("hidden", "");
 
-  document.querySelector("#prefs-btn")?.addEventListener("click", open);
+  document.querySelector("#prefs-btn")?.addEventListener("click", () => {
+    const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
+    if (actionsMenu) actionsMenu.open = false;
+    open();
+  });
   document.querySelector("#prefs-close")?.addEventListener("click", close);
   overlay?.addEventListener("click", (e) => {
     if (e.target === overlay) close();
@@ -752,7 +875,13 @@ window.addEventListener("DOMContentLoaded", () => {
   const container = document.querySelector<HTMLDivElement>("#editor-container");
   if (!container) return;
 
+  const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
+  const closeActionsMenu = () => {
+    if (actionsMenu && actionsMenu.open) actionsMenu.open = false;
+  };
+
   const chooseFile = () => {
+    closeActionsMenu();
     void (async () => {
       setStatus("Choose a file…");
       const selected = await openFileDialog({
@@ -765,17 +894,17 @@ window.addEventListener("DOMContentLoaded", () => {
   };
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
   wirePreferences();
-  const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
-  actionsMenu?.addEventListener("click", (event) => {
-    if ((event.target as HTMLElement).closest("button")) actionsMenu.open = false;
-  });
+  wireGotoDialog();
+
   window.addEventListener("pointerdown", (event) => {
     if (actionsMenu?.open && !actionsMenu.contains(event.target as Node)) {
       actionsMenu.open = false;
     }
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") actionsMenu && (actionsMenu.open = false);
+    if (event.key === "Escape") {
+      if (actionsMenu?.open) actionsMenu.open = false;
+    }
   });
 
   loadPrefs();
@@ -815,16 +944,39 @@ window.addEventListener("DOMContentLoaded", () => {
   updateHistoryControls();
 
   document.querySelector("#save-btn")?.addEventListener("click", () => {
+    closeActionsMenu();
     void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
   });
   document.querySelector("#save-as-btn")?.addEventListener("click", () => {
+    closeActionsMenu();
     void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
   });
   document.querySelector("#goto-btn")?.addEventListener("click", () => {
-    void goToPosition().catch((error) => setStatus(`Navigation failed: ${error}`));
+    closeActionsMenu();
+    goToPosition();
   });
-  document.querySelector("#undo-btn")?.addEventListener("click", () => editor.trigger("ui", "undo", null));
-  document.querySelector("#redo-btn")?.addEventListener("click", () => editor.trigger("ui", "redo", null));
+  document.querySelector("#undo-btn")?.addEventListener("click", () => {
+    closeActionsMenu();
+    editor.focus();
+    const model = editor.getModel() as any;
+    if (typeof model?.undo === "function") {
+      model.undo();
+    } else {
+      editor.trigger("ui", "undo", null);
+    }
+    updateHistoryControls();
+  });
+  document.querySelector("#redo-btn")?.addEventListener("click", () => {
+    closeActionsMenu();
+    editor.focus();
+    const model = editor.getModel() as any;
+    if (typeof model?.redo === "function") {
+      model.redo();
+    } else {
+      editor.trigger("ui", "redo", null);
+    }
+    updateHistoryControls();
+  });
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
     void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
   });
@@ -836,10 +988,26 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   );
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyG, () => {
-    void goToPosition().catch((error) => setStatus(`Navigation failed: ${error}`));
+    goToPosition();
   });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => editor.trigger("ui", "undo", null));
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => editor.trigger("ui", "redo", null));
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => {
+    const model = editor.getModel() as any;
+    if (typeof model?.undo === "function") {
+      model.undo();
+    } else {
+      editor.trigger("ui", "undo", null);
+    }
+    updateHistoryControls();
+  });
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => {
+    const model = editor.getModel() as any;
+    if (typeof model?.redo === "function") {
+      model.redo();
+    } else {
+      editor.trigger("ui", "redo", null);
+    }
+    updateHistoryControls();
+  });
 
   void listen<{ bytes_scanned: number; total_bytes: number }>(
     "scan-progress",
@@ -877,6 +1045,8 @@ window.addEventListener("DOMContentLoaded", () => {
 
   const searchInput =
     document.querySelector<HTMLInputElement>("#search-input");
+  const replaceInput =
+    document.querySelector<HTMLInputElement>("#replace-input");
   const matchCaseBox =
     document.querySelector<HTMLInputElement>("#match-case");
   const wholeWordBox =
@@ -896,9 +1066,13 @@ window.addEventListener("DOMContentLoaded", () => {
     searchInput?.focus();
     searchInput?.select();
   };
+  const focusReplace = () => {
+    replaceInput?.focus();
+    replaceInput?.select();
+  };
   const noop = () => {};
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, focusSearch);
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusSearch);
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusReplace);
   editor.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
   editor.addCommand(
     monaco.KeyMod.Shift | monaco.KeyCode.F3,
@@ -911,6 +1085,19 @@ window.addEventListener("DOMContentLoaded", () => {
   );
 
   document.querySelector("#search-btn")?.addEventListener("click", search);
+  document.querySelector("#replace-btn")?.addEventListener("click", () => {
+    void replaceCurrentMatch().catch((err) => setStatus(`Replace failed: ${err}`));
+  });
+  document.querySelector("#replace-all-btn")?.addEventListener("click", () => {
+    void replaceAllMatches().catch((err) => setStatus(`Replace all failed: ${err}`));
+  });
+
+  replaceInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void replaceCurrentMatch().catch((err) => setStatus(`Replace failed: ${err}`));
+    }
+  });
 
   // Enter steps through existing results; it only re-runs the search when the query changed.
   searchInput?.addEventListener("keydown", (e) => {
