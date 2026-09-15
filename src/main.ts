@@ -61,8 +61,56 @@ const DEFAULT_PREFS: Prefs = {
 };
 
 const PREFS_KEY = "gfe.prefs";
+const SEARCH_HISTORY_KEY = "gfe.search-history";
+const REPLACE_HISTORY_KEY = "gfe.replace-history";
 let prefs: Prefs = { ...DEFAULT_PREFS };
 let defaultFontFamily = "";
+
+function readHistory(key: string): string[] {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeHistory(key: string, entries: string[]) {
+  try {
+    localStorage.setItem(key, JSON.stringify(entries.slice(0, 12)));
+  } catch {}
+}
+
+function updateHistoryDatalist() {
+  const searchList = document.querySelector<HTMLDataListElement>("#search-history-list");
+  const replaceList = document.querySelector<HTMLDataListElement>("#replace-history-list");
+  const searchHistory = readHistory(SEARCH_HISTORY_KEY);
+  const replaceHistory = readHistory(REPLACE_HISTORY_KEY);
+
+  if (searchList) {
+    searchList.innerHTML = searchHistory
+      .map((value) => `<option value="${value.replace(/"/g, "&quot;")}"></option>`)
+      .join("");
+  }
+  if (replaceList) {
+    replaceList.innerHTML = replaceHistory
+      .map((value) => `<option value="${value.replace(/"/g, "&quot;")}"></option>`)
+      .join("");
+  }
+}
+
+function recordHistoryEntry(key: string, value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return;
+  const current = readHistory(key);
+  const next = [trimmed, ...current.filter((entry) => entry !== trimmed)].slice(0, 12);
+  writeHistory(key, next);
+  updateHistoryDatalist();
+}
 
 const windowLines = () => prefs.windowLines;
 const reanchorMargin = () => Math.max(50, Math.floor(prefs.windowLines / 5));
@@ -118,6 +166,7 @@ interface FileMeta {
   total_lines: number;
   size_bytes: number;
   newline: string;
+  encoding: string;
 }
 
 interface SearchHit {
@@ -648,7 +697,7 @@ async function openFile(path: string) {
     editor.setPosition({ lineNumber: modelLine, column: targetCol });
   }
 
-  const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline}`;
+  const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} · ${meta.encoding}`;
   setStatus(
     hasUnsavedRecovery
       ? `${baseStatus} (⚠️ previous session had unsaved changes)`
@@ -745,15 +794,17 @@ async function runSearch(query: string) {
 }
 
 function updateHitControls() {
-  const counter = document.querySelector<HTMLElement>("#hit-counter");
+  const counter = document.querySelector<HTMLInputElement>("#hit-counter");
   const prev = document.querySelector<HTMLButtonElement>("#prev-hit");
   const next = document.querySelector<HTMLButtonElement>("#next-hit");
   const replaceBtn = document.querySelector<HTMLButtonElement>("#replace-btn");
   const replaceAllBtn = document.querySelector<HTMLButtonElement>("#replace-all-btn");
   if (counter) {
-    counter.textContent = hits.length
-      ? `${hitIndex + 1}/${hits.length}${hitsTruncated ? "+" : ""}`
-      : "";
+    const value = hits.length ? `${hitIndex + 1}/${hits.length}${hitsTruncated ? "+" : ""}` : "";
+    if (document.activeElement !== counter) {
+      counter.value = value;
+      counter.setAttribute("title", value ? `Jump to result ${hitIndex + 1}` : "No matches");
+    }
   }
   const hasHits = hits.length > 0;
   const isReadOnly = prefs.readOnly;
@@ -761,6 +812,33 @@ function updateHitControls() {
   if (next) next.disabled = !hasHits;
   if (replaceBtn) replaceBtn.disabled = !currentPath || isReadOnly;
   if (replaceAllBtn) replaceAllBtn.disabled = !currentPath || isReadOnly;
+}
+
+function jumpToResultInput() {
+  const counter = document.querySelector<HTMLInputElement>("#hit-counter");
+  if (!counter || !hits.length) return;
+
+  const raw = counter.value.trim();
+  if (!raw) {
+    counter.value = hits.length ? `${hitIndex + 1}/${hits.length}${hitsTruncated ? "+" : ""}` : "";
+    return;
+  }
+
+  const normalized = raw.replace(/\s+/g, "").replace(/[^0-9/]+/g, "");
+  if (!normalized) {
+    counter.value = hits.length ? `${hitIndex + 1}/${hits.length}${hitsTruncated ? "+" : ""}` : "";
+    return;
+  }
+
+  let target = Number(normalized.split("/")[0]);
+  if (!Number.isFinite(target) || target < 1) {
+    counter.value = hits.length ? `${hitIndex + 1}/${hits.length}${hitsTruncated ? "+" : ""}` : "";
+    return;
+  }
+
+  target = Math.min(Math.max(Math.round(target), 1), hits.length);
+  void gotoHit(target - 1);
+  counter.value = `${target}/${hits.length}${hitsTruncated ? "+" : ""}`;
 }
 
 async function replaceCurrentMatch() {
@@ -1226,6 +1304,7 @@ function initApp() {
     document.querySelector<HTMLInputElement>("#search-input");
   const replaceInput =
     document.querySelector<HTMLInputElement>("#replace-input");
+  updateHistoryDatalist();
   const matchCaseBox =
     document.querySelector<HTMLInputElement>("#match-case");
   const wholeWordBox =
@@ -1263,17 +1342,26 @@ function initApp() {
     noop
   );
 
-  document.querySelector("#search-btn")?.addEventListener("click", search);
+  document.querySelector("#search-btn")?.addEventListener("click", () => {
+    const query = searchInput?.value ?? "";
+    recordHistoryEntry(SEARCH_HISTORY_KEY, query);
+    search();
+  });
   document.querySelector("#replace-btn")?.addEventListener("click", () => {
+    const value = replaceInput?.value ?? "";
+    recordHistoryEntry(REPLACE_HISTORY_KEY, value);
     void replaceCurrentMatch().catch((err) => setStatus(`Replace failed: ${err}`));
   });
   document.querySelector("#replace-all-btn")?.addEventListener("click", () => {
+    const value = replaceInput?.value ?? "";
+    recordHistoryEntry(REPLACE_HISTORY_KEY, value);
     void replaceAllMatches().catch((err) => setStatus(`Replace all failed: ${err}`));
   });
 
   replaceInput?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
+      recordHistoryEntry(REPLACE_HISTORY_KEY, replaceInput.value);
       void replaceCurrentMatch().catch((err) => setStatus(`Replace failed: ${err}`));
     }
   });
@@ -1282,6 +1370,7 @@ function initApp() {
   searchInput?.addEventListener("keydown", (e) => {
     if (e.key !== "Enter") return;
     e.preventDefault();
+    recordHistoryEntry(SEARCH_HISTORY_KEY, searchInput.value);
     const stale =
       searchInput.value !== lastQuery ||
       currentMatchCase() !== lastMatchCase ||
@@ -1300,6 +1389,23 @@ function initApp() {
   document
     .querySelector("#next-hit")
     ?.addEventListener("click", () => void gotoHit(hitIndex + 1));
+  document.querySelector<HTMLInputElement>("#hit-counter")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      jumpToResultInput();
+      (event.currentTarget as HTMLInputElement).blur();
+    }
+  });
+  document.querySelector<HTMLInputElement>("#hit-counter")?.addEventListener("blur", () => {
+    updateHitControls();
+  });
+  document.querySelector<HTMLInputElement>("#hit-counter")?.addEventListener("focus", () => {
+    const counter = document.querySelector<HTMLInputElement>("#hit-counter");
+    if (counter && hits.length) {
+      counter.select();
+    }
+  });
 
   matchCaseBox?.addEventListener("change", () => {
     lastQuery = null; // force a fresh search rather than stepping stale results
@@ -1328,8 +1434,17 @@ function initApp() {
     .catch((err) => setStatus(`Open failed: ${err}`));
 }
 
+const bootStatus = document.querySelector<HTMLElement>("#boot-status");
+if (bootStatus) {
+  bootStatus.classList.remove("hidden");
+}
+
 if (document.readyState === "loading") {
-  window.addEventListener("DOMContentLoaded", initApp);
+  window.addEventListener("DOMContentLoaded", () => {
+    initApp();
+    if (bootStatus) bootStatus.classList.add("hidden");
+  });
 } else {
   initApp();
+  if (bootStatus) bootStatus.classList.add("hidden");
 }

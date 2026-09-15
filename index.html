@@ -9,6 +9,7 @@
   </head>
 
   <body>
+    <div id="boot-status" aria-live="polite">Please wait…</div>
     <div id="toolbar">
       <details id="actions-menu" class="actions-menu">
         <summary id="menu-summary" title="Application menu">☰</summary>
@@ -64,13 +65,14 @@
     </div>
     <div id="findbar">
       <div class="find-row">
-        <input id="search-input" placeholder="Find in file…" />
+        <input id="search-input" placeholder="Find in file…" list="search-history-list" />
+        <datalist id="search-history-list"></datalist>
         <button id="search-btn">Search</button>
         <button id="prev-hit" title="Previous match (Shift+Enter)" disabled>
           ▲
         </button>
         <button id="next-hit" title="Next match (Enter)" disabled>▼</button>
-        <span id="hit-counter"></span>
+        <input id="hit-counter" type="text" value="" aria-label="Jump to result" inputmode="numeric" />
         <label class="switch">
           <input type="checkbox" id="match-case" />
           <span class="switch-track"><span class="switch-knob"></span></span>

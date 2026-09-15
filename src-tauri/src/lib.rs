@@ -610,6 +610,7 @@ struct FileMeta {
     total_lines: usize,
     size_bytes: usize,
     newline: String,
+    encoding: String,
 }
 
 /// 1-based line and UTF-16 column, i.e. directly usable as a Monaco `IPosition`. The end pair
@@ -688,6 +689,37 @@ fn detect_newline_format(bytes: &[u8]) -> String {
     }
 }
 
+fn detect_text_encoding(bytes: &[u8]) -> &'static str {
+    if bytes.is_empty() {
+        return "UTF-8";
+    }
+    if bytes.starts_with(b"\xEF\xBB\xBF") {
+        return "UTF-8";
+    }
+    if bytes.starts_with(b"\xFF\xFE") {
+        return "UTF-16LE";
+    }
+    if bytes.starts_with(b"\xFE\xFF") {
+        return "UTF-16BE";
+    }
+
+    let odd_nulls = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+    let even_nulls = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+    let total_nulls = odd_nulls + even_nulls;
+
+    if total_nulls > 0 && odd_nulls > even_nulls * 3 {
+        return "UTF-16LE";
+    }
+    if total_nulls > 0 && even_nulls > odd_nulls * 3 {
+        return "UTF-16BE";
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return "UTF-8";
+    }
+
+    "Binary"
+}
+
 /// Opens `path` with `mmap` and scans it for line breaks on a background task, then stores the
 /// resulting Piece Table in app state.
 #[tauri::command]
@@ -700,7 +732,7 @@ async fn open_file(
     let open_path = path.clone();
     let mtime = get_file_mtime_ms(&open_path);
 
-    let (table, newline_format) = tauri::async_runtime::spawn_blocking(move || -> Result<(PieceTable, String), String> {
+    let (table, newline_format, encoding) = tauri::async_runtime::spawn_blocking(move || -> Result<(PieceTable, String, String), String> {
         let file = File::open(&path).map_err(|e| e.to_string())?;
         // SAFETY: as with any mmap, behaviour is undefined if another process truncates the
         // file while it is mapped. That is the standard, unavoidable caveat of this approach.
@@ -708,6 +740,7 @@ async fn open_file(
 
         let sample_len = mmap.len().min(64 * 1024);
         let newline_format = detect_newline_format(&mmap[..sample_len]);
+        let encoding = detect_text_encoding(&mmap[..sample_len]).to_string();
 
         let total_bytes = mmap.len();
         let newlines = scan_newlines(&mmap, |scanned| {
@@ -719,7 +752,7 @@ async fn open_file(
                 },
             );
         });
-        Ok((PieceTable::new(Arc::new(mmap), Arc::new(newlines)), newline_format))
+        Ok((PieceTable::new(Arc::new(mmap), Arc::new(newlines)), newline_format, encoding))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -728,6 +761,7 @@ async fn open_file(
         total_lines: table.total_lines(),
         size_bytes: table.total_length(),
         newline: newline_format,
+        encoding,
     };
     *inner.lock().map_err(|e| e.to_string())? = Some(table);
     *state.path.lock().map_err(|e| e.to_string())? = Some(PathBuf::from(open_path));
@@ -770,6 +804,7 @@ async fn save_file(
                     total_lines: table.total_lines(),
                     size_bytes: table.total_length(),
                     newline: detect_newline_format(&sample),
+                    encoding: detect_text_encoding(&sample).to_string(),
                 })
             })();
             if result.is_err() { let _ = fs::remove_file(&temporary); }
@@ -1066,6 +1101,7 @@ async fn convert_line_endings(
             total_lines: table.total_lines(),
             size_bytes: table.total_length(),
             newline: detect_newline_format(&sample),
+            encoding: detect_text_encoding(&sample).to_string(),
         }
     })
     .await
@@ -1176,6 +1212,21 @@ mod tests {
         assert_eq!(t.offset_of_position(1, 5), 7); // after the surrogate pair
         assert_eq!(t.position_of_offset(7), (1, 5));
         assert_eq!(t.position_of_offset(9), (2, 1));
+    }
+
+    #[test]
+    fn detect_encoding_handles_utf8_utf16_and_binary() {
+        let utf8 = b"hello\nworld";
+        assert_eq!(detect_text_encoding(utf8), "UTF-8");
+
+        let utf16le = "hello\nworld"
+            .encode_utf16()
+            .flat_map(|ch| ch.to_le_bytes())
+            .collect::<Vec<u8>>();
+        assert_eq!(detect_text_encoding(&utf16le), "UTF-16LE");
+
+        let binary = vec![0, 159, 255, 0, 2, 3, 4];
+        assert_eq!(detect_text_encoding(&binary), "Binary");
     }
 
     #[test]
