@@ -266,6 +266,49 @@ async function saveDocument(path: string | null = currentPath) {
   setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes saved`);
 }
 
+function wireExternalChangeDialog() {
+  const overlay = document.querySelector<HTMLElement>("#external-change-overlay");
+  const reloadBtn = document.querySelector<HTMLButtonElement>("#reload-file-btn");
+  const ignoreBtn = document.querySelector<HTMLButtonElement>("#ignore-change-btn");
+
+  const close = () => {
+    overlay?.setAttribute("hidden", "");
+    editor?.focus();
+  };
+
+  reloadBtn?.addEventListener("click", () => {
+    close();
+    if (currentPath) {
+      void openFile(currentPath);
+    }
+  });
+
+  ignoreBtn?.addEventListener("click", close);
+  overlay?.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+}
+
+function promptExternalChange() {
+  const overlay = document.querySelector<HTMLElement>("#external-change-overlay");
+  if (overlay && overlay.hasAttribute("hidden")) {
+    overlay.removeAttribute("hidden");
+  }
+}
+
+async function checkExternalChange() {
+  if (!currentPath) return;
+  const overlay = document.querySelector<HTMLElement>("#external-change-overlay");
+  if (overlay && !overlay.hasAttribute("hidden")) return;
+
+  try {
+    const changed = await invoke<boolean>("check_file_changed");
+    if (changed) {
+      promptExternalChange();
+    }
+  } catch {}
+}
+
 function wireGotoDialog() {
   const overlay = document.querySelector<HTMLElement>("#goto-overlay");
   const input = document.querySelector<HTMLInputElement>("#goto-input");
@@ -895,6 +938,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
   wirePreferences();
   wireGotoDialog();
+  wireExternalChangeDialog();
 
   window.addEventListener("pointerdown", (event) => {
     if (actionsMenu?.open && !actionsMenu.contains(event.target as Node)) {
@@ -1136,9 +1180,13 @@ window.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("beforeunload", () => {
     if (dirty) persistRecoveryState();
   });
+  window.addEventListener("focus", () => {
+    void checkExternalChange();
+  });
   setInterval(() => {
     if (dirty) persistRecoveryState();
-  }, 5000);
+    void checkExternalChange();
+  }, 4000);
 
   void invoke<string | null>("startup_path")
     .then((path) => (path ? openFile(path) : undefined))

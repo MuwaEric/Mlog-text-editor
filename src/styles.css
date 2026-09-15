@@ -291,12 +291,14 @@ body {
 }
 
 #prefs-overlay[hidden],
-#goto-overlay[hidden] {
+#goto-overlay[hidden],
+#external-change-overlay[hidden] {
   display: none;
 }
 
 #prefs-overlay,
-#goto-overlay {
+#goto-overlay,
+#external-change-overlay {
   position: fixed;
   inset: 0;
   background: #00000066;
@@ -307,7 +309,8 @@ body {
 }
 
 #prefs-panel,
-#goto-panel {
+#goto-panel,
+#external-change-panel {
   background: #fff;
   color: #0f0f0f;
   border-radius: 8px;
@@ -320,7 +323,8 @@ body {
 }
 
 #prefs-panel h2,
-#goto-panel h2 {
+#goto-panel h2,
+#external-change-panel h2 {
   margin: 0 0 0.75em;
   font-size: 1.1em;
 }

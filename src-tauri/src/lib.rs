@@ -602,6 +602,7 @@ const MAX_REPORTED_HITS: usize = 5_000;
 struct AppState {
     table: Arc<Mutex<Option<PieceTable>>>,
     path: Arc<Mutex<Option<PathBuf>>>,
+    last_modified_ms: Arc<Mutex<u64>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -666,6 +667,15 @@ where
     .map_err(|e| e.to_string())?
 }
 
+use std::time::UNIX_EPOCH;
+
+fn get_file_mtime_ms(path: &str) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Opens `path` with `mmap` and scans it for line breaks on a background task, then stores the
 /// resulting Piece Table in app state.
 #[tauri::command]
@@ -676,6 +686,7 @@ async fn open_file(
 ) -> Result<FileMeta, String> {
     let inner = state.table.clone();
     let open_path = path.clone();
+    let mtime = get_file_mtime_ms(&open_path);
 
     let table = tauri::async_runtime::spawn_blocking(move || -> Result<PieceTable, String> {
         let file = File::open(&path).map_err(|e| e.to_string())?;
@@ -704,6 +715,7 @@ async fn open_file(
     };
     *inner.lock().map_err(|e| e.to_string())? = Some(table);
     *state.path.lock().map_err(|e| e.to_string())? = Some(PathBuf::from(open_path));
+    *state.last_modified_ms.lock().map_err(|e| e.to_string())? = mtime;
     Ok(meta)
 }
 
@@ -745,8 +757,27 @@ async fn save_file(
     })
     .await
     .map_err(|e| e.to_string())??;
+    let new_mtime = get_file_mtime_ms(&target.to_string_lossy());
     *state.path.lock().map_err(|e| e.to_string())? = Some(target);
+    *state.last_modified_ms.lock().map_err(|e| e.to_string())? = new_mtime;
     Ok(meta)
+}
+
+/// Checks if the currently opened file on disk has been modified externally.
+#[tauri::command]
+async fn check_file_changed(state: State<'_, AppState>) -> Result<bool, String> {
+    let path_opt = state.path.lock().map_err(|e| e.to_string())?.clone();
+    let path = match path_opt {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let recorded_mtime = *state.last_modified_ms.lock().map_err(|e| e.to_string())?;
+    if recorded_mtime == 0 {
+        return Ok(false);
+    }
+    let current_mtime = get_file_mtime_ms(&path.to_string_lossy());
+    // If mtime is newer by more than a tiny tolerance (10ms)
+    Ok(current_mtime > recorded_mtime)
 }
 
 /// Fetches only the lines Monaco currently needs to render (its virtual viewport), never the
@@ -1010,6 +1041,7 @@ pub fn run() {
             search_text,
             replace_match,
             replace_all,
+            check_file_changed,
             startup_path
         ])
         .run(tauri::generate_context!())
