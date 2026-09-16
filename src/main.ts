@@ -323,11 +323,12 @@ function updateDocumentState() {
   const replaceAllBtn = document.querySelector<HTMLButtonElement>("#replace-all-btn");
   const name = document.querySelector<HTMLElement>("#file-name");
 
+  const hasModel = !!editor?.getModel();
   const hasFile = Boolean(currentPath);
   const isReadOnly = prefs.readOnly;
 
-  if (save) save.disabled = !hasFile || !dirty || isReadOnly;
-  if (saveAs) saveAs.disabled = !hasFile;
+  if (save) save.disabled = !hasModel || !dirty || isReadOnly;
+  if (saveAs) saveAs.disabled = !hasModel || isReadOnly;
   if (gotoBtn) gotoBtn.disabled = !hasFile;
   if (convertCrlf) convertCrlf.disabled = !hasFile || isReadOnly;
   if (convertLf) convertLf.disabled = !hasFile || isReadOnly;
@@ -335,9 +336,13 @@ function updateDocumentState() {
   if (replaceAllBtn) replaceAllBtn.disabled = !hasFile || isReadOnly;
   if (name) {
     const readOnlyTag = isReadOnly ? " [Read-Only]" : "";
-    name.textContent = hasFile
-      ? `${currentPath!.split("/").pop() ?? currentPath}${dirty ? " *" : ""}${readOnlyTag}`
-      : "No file open";
+    if (hasFile) {
+      name.textContent = `${currentPath!.split("/").pop() ?? currentPath}${dirty ? " *" : ""}${readOnlyTag}`;
+    } else if (hasModel) {
+      name.textContent = `Untitled${dirty ? " *" : ""}${readOnlyTag}`;
+    } else {
+      name.textContent = `No file open`;
+    }
   }
 }
 

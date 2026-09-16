@@ -4,7 +4,7 @@
 // `giant_file_editor_lib::run()`). All commands therefore live here so they can be registered
 // with `invoke_handler`; `main.rs` stays a thin OS entry point per Tauri convention.
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use regex::bytes::RegexBuilder;
 use serde::Serialize;
@@ -598,11 +598,26 @@ fn search_document_with_progress(
 /// hits, and serializing them over IPC would defeat the whole point of streaming the file.
 const MAX_REPORTED_HITS: usize = 5_000;
 
-#[derive(Default)]
+fn empty_piece_table() -> PieceTable {
+    let mmap = unsafe { MmapOptions::new().len(0).map_anon() }.unwrap();
+    let mmap = mmap.make_read_only().unwrap();
+    PieceTable::new(Arc::new(mmap), Arc::new(Vec::new()))
+}
+
 struct AppState {
     table: Arc<Mutex<Option<PieceTable>>>,
     path: Arc<Mutex<Option<PathBuf>>>,
     last_modified_ms: Arc<Mutex<u64>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            table: Arc::new(Mutex::new(Some(empty_piece_table()))),
+            path: Arc::new(Mutex::new(None)),
+            last_modified_ms: Arc::new(Mutex::new(0)),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -1161,6 +1176,16 @@ mod tests {
 
     fn whole(t: &PieceTable) -> String {
         t.get_text_range(0, t.total_length())
+    }
+
+    #[test]
+    fn untitled_documents_start_with_an_empty_table() {
+        let state = AppState::default();
+        let guard = state.table.lock().unwrap();
+        assert!(guard.is_some(), "new untitled documents should have a backing table");
+        let table = guard.as_ref().unwrap();
+        assert_eq!(table.total_length(), 0);
+        assert_eq!(table.total_lines(), 1);
     }
 
     #[test]
