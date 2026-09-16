@@ -1444,12 +1444,26 @@ if (bootStatus) {
   bootStatus.classList.remove("hidden");
 }
 
-if (document.readyState === "loading") {
-  window.addEventListener("DOMContentLoaded", () => {
+// A throw in initApp() used to leave the boot overlay up forever with no clue why.
+function boot() {
+  try {
     initApp();
     if (bootStatus) bootStatus.classList.add("hidden");
-  });
+  } catch (error) {
+    if (bootStatus) {
+      bootStatus.textContent = `Startup failed: ${
+        error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error)
+      }`;
+      bootStatus.style.whiteSpace = "pre-wrap";
+      bootStatus.style.padding = "2em";
+      bootStatus.style.overflow = "auto";
+    }
+    throw error;
+  }
+}
+
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", boot);
 } else {
-  initApp();
-  if (bootStatus) bootStatus.classList.add("hidden");
+  boot();
 }

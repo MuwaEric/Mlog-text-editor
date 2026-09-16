@@ -599,7 +599,7 @@ fn search_document_with_progress(
 const MAX_REPORTED_HITS: usize = 5_000;
 
 fn empty_piece_table() -> PieceTable {
-    let mmap = unsafe { MmapOptions::new().len(0).map_anon() }.unwrap();
+    let mmap = MmapOptions::new().len(0).map_anon().unwrap();
     let mmap = mmap.make_read_only().unwrap();
     PieceTable::new(Arc::new(mmap), Arc::new(Vec::new()))
 }

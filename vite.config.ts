@@ -10,6 +10,16 @@ export default defineConfig(() => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
+  // Pre-bundle up front: if the optimizer runs on first request instead, it answers in-flight
+  // module requests with 504s and WebKitGTK never recovers (the window hangs on the boot overlay).
+  optimizeDeps: {
+    include: [
+      "monaco-editor",
+      "@tauri-apps/api/core",
+      "@tauri-apps/api/event",
+      "@tauri-apps/plugin-dialog",
+    ],
+  },
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,
