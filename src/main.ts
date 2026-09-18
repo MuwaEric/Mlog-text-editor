@@ -1513,7 +1513,7 @@ function boot() {
 }
 
 if (document.readyState === "loading") {
-  window.addEventListener("DOMContentLoaded", boot);
+  document.addEventListener("DOMContentLoaded", boot);
 } else {
   boot();
 }
