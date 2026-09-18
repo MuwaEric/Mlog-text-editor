@@ -1343,6 +1343,24 @@ mod tests {
     }
 
     #[test]
+    fn rapid_get_lines_on_large_table() {
+        // Construct a large piece table representation
+        let mut large_content = String::with_capacity(1_000_000);
+        for i in 0..50_000 {
+            use std::fmt::Write;
+            let _ = writeln!(large_content, "Line {}: sample data text for piece table line indexing test", i);
+        }
+        let t = table(&large_content);
+        assert_eq!(t.total_lines(), 50_001);
+
+        // Perform fast repeated line range queries across distant offsets
+        for start in (1..45_000).step_by(1_000) {
+            let res = t.get_lines(start, start + 4000);
+            assert!(!res.is_empty());
+        }
+    }
+
+    #[test]
     fn convert_line_endings_between_lf_and_crlf() {
         let mut t = table("line 1\nline 2\nline 3\n");
         assert_eq!(detect_newline_format(whole(&t).as_bytes()), "LF");

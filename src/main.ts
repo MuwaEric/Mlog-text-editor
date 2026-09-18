@@ -198,6 +198,7 @@ let windowCount = 0; // lines currently in the model
 let viewTop = 1; // file line at the top of the viewport
 let syncing = false; // suppresses scroll/content handling while we re-anchor
 let reanchoring = false;
+let navRequestId = 0;
 let pendingEdits: Promise<unknown> = Promise.resolve();
 
 let hits: SearchHit[] = [];
@@ -380,9 +381,12 @@ async function convertLineEndingsTo(target: "LF" | "CRLF") {
   dirty = true;
   updateDocumentState();
   persistRecoveryState();
-  await anchorWindow(viewTop);
-  scrollToViewTop();
-  updateScrollbar();
+  const reqId = ++navRequestId;
+  await anchorWindow(viewTop, reqId);
+  if (reqId === navRequestId) {
+    scrollToViewTop();
+    updateScrollbar();
+  }
   setStatus(`Converted line endings to ${meta.newline} (${meta.total_lines.toLocaleString()} lines)`);
 }
 
@@ -535,29 +539,35 @@ function maxViewTop(): number {
   return Math.max(1, totalLines - linesPerScreen() + 1);
 }
 
-/** Loads a fresh window of lines into the model, starting at `start`. */
-async function anchorWindow(start: number) {
-  if (!currentPath) return;
+/** Loads a fresh window of lines into the model, starting at `start`. Returns true if applied. */
+async function anchorWindow(start: number, reqId: number = navRequestId): Promise<boolean> {
+  if (!currentPath) return false;
   const maxStart = Math.max(1, totalLines - windowLines() + 1);
   const newStart = Math.min(Math.max(1, Math.round(start)), maxStart);
   const end = Math.min(newStart + windowLines() - 1, totalLines);
 
   await pendingEdits; // never read lines the backend has not applied edits to yet
+  if (reqId !== navRequestId) return false;
+
   const raw = await invoke<string>("get_lines", {
     startLine: newStart,
     endLine: end,
   });
+
+  if (reqId !== navRequestId) return false;
+
   // Every line arrives newline-terminated; keeping the last one would add a phantom empty line.
   const text = end < totalLines ? raw.replace(/\n$/, "") : raw;
 
   const model = editor.getModel();
-  if (!model) return;
+  if (!model) return false;
   syncing = true;
   model.setValue(text);
   windowStart = newStart;
   windowCount = model.getLineCount();
   updateSearchDecorations();
   syncing = false;
+  return true;
 }
 
 function scrollToViewTop() {
@@ -573,6 +583,7 @@ function scrollToViewTop() {
 
 /** Moves the viewport so `fileLine` is the top visible line, re-anchoring the window if needed. */
 async function goToLine(fileLine: number) {
+  const reqId = ++navRequestId;
   viewTop = Math.min(Math.max(1, Math.round(fileLine)), maxViewTop());
   if (currentPath) {
     const pos = editor?.getPosition();
@@ -589,8 +600,11 @@ async function goToLine(fileLine: number) {
       viewTop + visible > windowStart + windowCount - reanchorMargin());
 
   if (needsWindow) {
-    await anchorWindow(viewTop - Math.floor((windowLines() - visible) / 2));
+    const targetStart = viewTop - Math.floor((windowLines() - visible) / 2);
+    const ok = await anchorWindow(targetStart, reqId);
+    if (!ok || reqId !== navRequestId) return;
   }
+  if (reqId !== navRequestId) return;
   scrollToViewTop();
   updateScrollbar();
 }
@@ -606,10 +620,14 @@ async function maybeReanchor() {
   if (!nearTop && !nearBottom) return;
 
   reanchoring = true;
+  const reqId = ++navRequestId;
   try {
-    await anchorWindow(viewTop - Math.floor((windowLines() - visible) / 2));
-    scrollToViewTop();
-    updateScrollbar();
+    const targetStart = viewTop - Math.floor((windowLines() - visible) / 2);
+    const ok = await anchorWindow(targetStart, reqId);
+    if (ok && reqId === navRequestId) {
+      scrollToViewTop();
+      updateScrollbar();
+    }
   } finally {
     reanchoring = false;
   }
@@ -638,6 +656,8 @@ function wireScrollbar() {
   if (!track || !thumb) return;
 
   let dragging = false;
+  let rafId: number | null = null;
+  let lastClientY = 0;
 
   const lineFromClientY = (clientY: number) => {
     const rect = track.getBoundingClientRect();
@@ -647,17 +667,36 @@ function wireScrollbar() {
     return 1 + Math.min(Math.max(0, pos), 1) * (maxViewTop() - 1);
   };
 
+  const processDrag = () => {
+    rafId = null;
+    if (dragging) {
+      void goToLine(lineFromClientY(lastClientY));
+    }
+  };
+
   thumb.addEventListener("pointerdown", (e) => {
     dragging = true;
     thumb.setPointerCapture(e.pointerId);
     e.preventDefault();
   });
   thumb.addEventListener("pointermove", (e) => {
-    if (dragging) void goToLine(lineFromClientY(e.clientY));
+    if (dragging) {
+      lastClientY = e.clientY;
+      if (rafId === null) {
+        rafId = requestAnimationFrame(processDrag);
+      }
+    }
   });
   const stop = (e: PointerEvent) => {
-    dragging = false;
-    thumb.releasePointerCapture(e.pointerId);
+    if (dragging) {
+      dragging = false;
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      thumb.releasePointerCapture(e.pointerId);
+      void goToLine(lineFromClientY(e.clientY));
+    }
   };
   thumb.addEventListener("pointerup", stop);
   thumb.addEventListener("pointercancel", stop);
@@ -693,9 +732,12 @@ async function openFile(path: string) {
   lastQuery = null;
   updateHitControls();
 
-  await anchorWindow(viewTop);
-  scrollToViewTop();
-  updateScrollbar();
+  const reqId = ++navRequestId;
+  await anchorWindow(viewTop, reqId);
+  if (reqId === navRequestId) {
+    scrollToViewTop();
+    updateScrollbar();
+  }
 
   const modelLine = toModelLine(targetFileLine);
   if (modelLine >= 1 && modelLine <= windowCount) {
@@ -874,9 +916,12 @@ async function replaceCurrentMatch() {
   dirty = true;
   updateDocumentState();
   persistRecoveryState();
-  await anchorWindow(viewTop);
-  scrollToViewTop();
-  updateScrollbar();
+  let reqId = ++navRequestId;
+  await anchorWindow(viewTop, reqId);
+  if (reqId === navRequestId) {
+    scrollToViewTop();
+    updateScrollbar();
+  }
 
   if (lastQuery) {
     await runSearch(lastQuery);
@@ -916,9 +961,12 @@ async function replaceAllMatches() {
   dirty = true;
   updateDocumentState();
   persistRecoveryState();
-  await anchorWindow(viewTop);
-  scrollToViewTop();
-  updateScrollbar();
+  const reqId = ++navRequestId;
+  await anchorWindow(viewTop, reqId);
+  if (reqId === navRequestId) {
+    scrollToViewTop();
+    updateScrollbar();
+  }
   setStatus(`Replaced ${result.replaced_count.toLocaleString()} occurrence(s)`);
 
   hits = [];
@@ -1177,7 +1225,9 @@ function initApp() {
       });
     }
     updateScrollbar();
-    void maybeReanchor();
+    if (!reanchoring) {
+      void maybeReanchor();
+    }
   });
   editor.onDidLayoutChange(() => updateScrollbar());
   editor.onDidChangeCursorPosition(({ position }) => {
