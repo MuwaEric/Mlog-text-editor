@@ -27,6 +27,7 @@ rayon = "1"
 memchr = "2"
 regex = "1"
 tauri-plugin-dialog = "2.7.3"
+libc = "0.2.189"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

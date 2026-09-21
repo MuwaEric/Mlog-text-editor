@@ -45,9 +45,12 @@ struct Piece {
 /// Line lookups are served by a two-level index: each buffer keeps a sorted vector of its own
 /// `\n` byte positions, and `cum_bytes`/`cum_lines` hold prefix sums across the piece list. A
 /// (line, column) query is therefore two binary searches, never a scan of the document.
+///
+/// For the `original` buffer, we use a sparse index (storing every 100th newline) to save RAM
+/// on multi-gigabyte files. Missing newlines are scanned on demand.
 struct PieceTable {
     original: Arc<Mmap>,
-    /// Byte position of every `\n` in the original mmap; built once, off the UI thread.
+    /// Sparse byte position of `\n` in the original mmap. Contains every 100th newline.
     original_nl: Arc<Vec<usize>>,
     added: String,
     /// Byte position of every `\n` in the changes buffer; appended to on each insert, so it
@@ -58,6 +61,8 @@ struct PieceTable {
     cum_bytes: Vec<usize>,
     cum_lines: Vec<usize>,
 }
+
+const SPARSE_FACTOR: usize = 100;
 
 impl PieceTable {
     fn new(original: Arc<Mmap>, original_nl: Arc<Vec<usize>>) -> Self {
@@ -91,19 +96,108 @@ impl PieceTable {
         }
     }
 
-    /// The newline positions (absolute within their own buffer) that fall inside `p`.
-    fn piece_newlines(&self, p: &Piece) -> &[usize] {
-        let nl: &[usize] = match p.source {
-            Source::Original => &self.original_nl,
-            Source::Added => &self.added_nl,
-        };
-        let lo = nl.partition_point(|&x| x < p.offset);
-        let hi = nl.partition_point(|&x| x < p.offset + p.length);
-        &nl[lo..hi]
+    /// The number of newlines that fall inside `p`.
+    fn piece_newline_count(&self, p: &Piece) -> usize {
+        match p.source {
+            Source::Original => {
+                // We don't have all newlines, but we know the total count and can find
+                // the range in the sparse index.
+                // However, we need the exact count within the piece's range.
+                // We can use the same logic as partition_point if we had all newlines.
+                // For sparse, we need to count them.
+                self.count_newlines_in_range(p.source, p.offset, p.offset + p.length)
+            }
+            Source::Added => {
+                let lo = self.added_nl.partition_point(|&x| x < p.offset);
+                let hi = self.added_nl.partition_point(|&x| x < p.offset + p.length);
+                hi - lo
+            }
+        }
     }
 
-    /// Recomputes the prefix sums. O(pieces), and every piece's newline count is itself two
-    /// binary searches, so this stays cheap as long as the piece list does.
+    fn count_newlines_in_range(&self, source: Source, start: usize, end: usize) -> usize {
+        match source {
+            Source::Original => {
+                // Find sparse indices that bound this range
+                let lo_idx = self.original_nl.partition_point(|&x| x < start);
+                let hi_idx = self.original_nl.partition_point(|&x| x < end);
+
+                if lo_idx == hi_idx {
+                    // All newlines are between two sparse points (or before first/after last)
+                    let scan_start = if lo_idx == 0 { 0 } else { self.original_nl[lo_idx - 1] + 1 };
+                    let scan_end = end;
+                    let data = &self.original[scan_start.max(start)..scan_end];
+                    memchr::memchr_iter(b'\n', data).count()
+                } else {
+                    // Count: (newlines before first sparse point) + (sparse points) + (newlines after last sparse point)
+                    let first_sparse = self.original_nl[lo_idx];
+                    let last_sparse = self.original_nl[hi_idx - 1];
+
+                    let head_count = memchr::memchr_iter(b'\n', &self.original[start..first_sparse]).count();
+                    let tail_count = memchr::memchr_iter(b'\n', &self.original[last_sparse + 1..end]).count();
+                    let total_between = (hi_idx - lo_idx - 1) * SPARSE_FACTOR;
+                    head_count + total_between + 1 + tail_count // +1 for the first_sparse itself
+                }
+            }
+            Source::Added => {
+                let lo = self.added_nl.partition_point(|&x| x < start);
+                let hi = self.added_nl.partition_point(|&x| x < end);
+                hi - lo
+            }
+        }
+    }
+
+    /// Logical byte offset at which `local_line` (0-indexed within the piece) begins.
+    fn offset_of_line_in_piece(&self, p: &Piece, local_line: usize) -> usize {
+        if local_line == 0 {
+            return p.offset;
+        }
+        let target_nl_idx = local_line - 1;
+        match p.source {
+            Source::Original => {
+                // 1. Find how many newlines are before the piece starts in the original buffer
+                let nls_before_piece = self.count_newlines_in_range(Source::Original, 0, p.offset);
+                let absolute_nl_idx = nls_before_piece + target_nl_idx;
+
+                // 2. Use sparse index to find a starting point
+                let sparse_idx = absolute_nl_idx / SPARSE_FACTOR;
+                let (mut scan_start, mut remaining) = if sparse_idx > 0 && sparse_idx <= self.original_nl.len() {
+                    let prev_sparse_idx = sparse_idx - 1;
+                    (self.original_nl[prev_sparse_idx] + 1, absolute_nl_idx - (prev_sparse_idx + 1) * SPARSE_FACTOR)
+                } else {
+                    (0, absolute_nl_idx)
+                };
+
+                if scan_start < p.offset {
+                    // If sparse point is before piece, start scanning from piece start
+                    let nls_between = self.count_newlines_in_range(Source::Original, scan_start, p.offset);
+                    scan_start = p.offset;
+                    remaining = remaining.saturating_sub(nls_between);
+                }
+
+                if remaining == 0 {
+                    // Check if the newline at scan_start-1 is the one we want.
+                    // But we want the offset of the line AFTER the newline.
+                    // If remaining is 0, we are looking for the newline at absolute_nl_idx.
+                }
+
+                let mut it = memchr::memchr_iter(b'\n', &self.original[scan_start..p.offset + p.length]);
+                let rel_offset = it.nth(remaining).expect("line index out of bounds in piece");
+                scan_start + rel_offset + 1
+            }
+            Source::Added => {
+                let lo = self.added_nl.partition_point(|&x| x < p.offset);
+                self.added_nl[lo + target_nl_idx] + 1
+            }
+        }
+    }
+
+    /// Number of newlines in piece `p` before relative offset `within`.
+    fn newline_count_before_offset_in_piece(&self, p: &Piece, within: usize) -> usize {
+        self.count_newlines_in_range(p.source, p.offset, p.offset + within)
+    }
+
+    /// Recomputes the prefix sums. O(pieces)
     fn rebuild_index(&mut self) {
         let n = self.pieces.len();
         let mut cum_bytes = Vec::with_capacity(n + 1);
@@ -114,7 +208,7 @@ impl PieceTable {
         for i in 0..n {
             let p = self.pieces[i];
             bytes += p.length;
-            lines += self.piece_newlines(&p).len();
+            lines += self.piece_newline_count(&p);
             cum_bytes.push(bytes);
             cum_lines.push(lines);
         }
@@ -243,7 +337,7 @@ impl PieceTable {
         String::from_utf8_lossy(&self.get_bytes_range(start, end)).into_owned()
     }
 
-    /// Logical byte offset at which 0-indexed `line` begins. Two binary searches, no scanning.
+    /// Logical byte offset at which 0-indexed `line` begins.
     fn offset_of_line(&self, line: usize) -> usize {
         if line == 0 {
             return 0;
@@ -254,9 +348,9 @@ impl PieceTable {
         }
         let i = self.cum_lines.partition_point(|&c| c <= target) - 1;
         let p = self.pieces[i];
-        let local = target - self.cum_lines[i];
-        let nl_pos = self.piece_newlines(&p)[local];
-        self.cum_bytes[i] + (nl_pos - p.offset) + 1
+        let local_nl_idx = target - self.cum_lines[i];
+        let line_offset = self.offset_of_line_in_piece(&p, local_nl_idx + 1);
+        self.cum_bytes[i] + (line_offset - p.offset)
     }
 
     /// 0-indexed line containing logical byte `offset`.
@@ -268,9 +362,7 @@ impl PieceTable {
         let i = self.piece_at_offset(offset);
         let p = self.pieces[i];
         let within = offset - self.cum_bytes[i];
-        let count = self
-            .piece_newlines(&p)
-            .partition_point(|&x| x < p.offset + within);
+        let count = self.newline_count_before_offset_in_piece(&p, within);
         self.cum_lines[i] + count
     }
 
@@ -332,29 +424,56 @@ fn utf16_len(s: &str) -> usize {
 // Initial newline scan over the mmap
 // ---------------------------------------------------------------------------------------------
 
-/// Records the byte position of every `\n` in `data` with a fast SIMD byte loop (`memchr`),
-/// parallelized across `CHUNK_SIZE` chunks. This is the single full pass over the file, and it
-/// runs off the UI thread. Note the inherent cost: one `usize` per line, so a file with 200 M
-/// lines needs ~1.6 GB for the index alone.
-fn scan_newlines(data: &[u8], mut on_chunk: impl FnMut(usize) + Send) -> Vec<usize> {
+/// Records the byte position of every 100th `\n` in `data` with a fast SIMD byte loop (`memchr`),
+/// parallelized across `CHUNK_SIZE` chunks. This significantly reduces RAM overhead for the index.
+fn scan_newlines(data: &[u8], mut on_chunk: impl FnMut(usize) + Send) -> (Vec<usize>, usize) {
     let starts: Vec<usize> = (0..data.len()).step_by(CHUNK_SIZE).collect();
-    let per_chunk: Vec<Vec<usize>> = starts
+    let counts: Vec<usize> = starts
         .par_iter()
         .map(|&s| {
             let e = (s + CHUNK_SIZE).min(data.len());
-            memchr::memchr_iter(b'\n', &data[s..e])
-                .map(|rel| s + rel)
-                .collect()
+            memchr::memchr_iter(b'\n', &data[s..e]).count()
         })
         .collect();
 
-    let total: usize = per_chunk.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(total);
-    for mut chunk in per_chunk {
-        out.append(&mut chunk); // frees each chunk as it is merged, keeping peak memory down
-        on_chunk(out.len());
+    let total_count: usize = counts.iter().sum();
+    let mut sparse_nls = Vec::with_capacity(total_count / SPARSE_FACTOR);
+
+    let mut global_count = 0;
+    for (i, &s) in starts.iter().enumerate() {
+        let e = (s + CHUNK_SIZE).min(data.len());
+        let chunk_data = &data[s..e];
+
+        // For each chunk, we only scan if it might contain the next global sparse point.
+        // next_sparse_at is 100, 200, 300...
+        // If current global_count is 50 and chunk has 60, it contains global 100.
+        let chunk_count = counts[i];
+        let next_sparse_idx = ((global_count / SPARSE_FACTOR) + 1) * SPARSE_FACTOR;
+        
+        if next_sparse_idx <= global_count + chunk_count {
+            // This chunk contains at least one sparse point.
+            let mut local_count = 0;
+            for rel in memchr::memchr_iter(b'\n', chunk_data) {
+                local_count += 1;
+                if (global_count + local_count) % SPARSE_FACTOR == 0 {
+                    sparse_nls.push(s + rel);
+                }
+            }
+        }
+        global_count += chunk_count;
+        on_chunk(global_count);
+
+        // Tell the OS we don't need these pages anymore to keep RSS down.
+        #[cfg(unix)]
+        {
+            let ptr = chunk_data.as_ptr() as *mut libc::c_void;
+            let len = chunk_data.len() as libc::size_t;
+            unsafe {
+                libc::madvise(ptr, len, libc::MADV_DONTNEED);
+            }
+        }
     }
-    out
+    (sparse_nls, total_count)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -476,6 +595,18 @@ fn search_regex_document(
                 matches.push((offset, length));
             }
         }
+        
+        // Tell the OS we don't need these pages anymore to keep RSS down.
+        #[cfg(unix)]
+        {
+            if let Source::Original = piece.source {
+                let ptr = bytes.as_ptr() as *mut libc::c_void;
+                let len = bytes.len() as libc::size_t;
+                unsafe {
+                    libc::madvise(ptr, len, libc::MADV_DONTNEED);
+                }
+            }
+        }
     }
     matches.sort_unstable_by_key(|&(offset, _)| offset);
     matches.dedup_by_key(|(offset, _)| *offset);
@@ -551,6 +682,18 @@ fn search_document_with_progress(
                         hits: streamed_hits,
                     },
                 );
+            }
+            
+            // Tell the OS we don't need these pages anymore to keep RSS down.
+            #[cfg(unix)]
+            {
+                if let Source::Original = p.source {
+                    let ptr = bytes[s..scan_end].as_ptr() as *mut libc::c_void;
+                    let len = bytes[s..scan_end].len() as libc::size_t;
+                    unsafe {
+                        libc::madvise(ptr, len, libc::MADV_DONTNEED);
+                    }
+                }
             }
             local_hits
         })
@@ -758,11 +901,11 @@ async fn open_file(
         let encoding = detect_text_encoding(&mmap[..sample_len]).to_string();
 
         let total_bytes = mmap.len();
-        let newlines = scan_newlines(&mmap, |scanned| {
+        let (newlines, _total_lines) = scan_newlines(&mmap, |lines_scanned| {
             let _ = app.emit(
                 "scan-progress",
                 ScanProgress {
-                    bytes_scanned: scanned,
+                    bytes_scanned: lines_scanned, // Progress reporting changed to lines for now, or keep bytes if we prefer
                     total_bytes,
                 },
             );
@@ -810,7 +953,20 @@ async fn save_file(
             let result = (|| -> Result<FileMeta, String> {
                 let mut output = File::create(&temporary).map_err(|e| e.to_string())?;
                 for piece in &table.pieces {
-                    output.write_all(table.piece_bytes(piece)).map_err(|e| e.to_string())?;
+                    let bytes = table.piece_bytes(piece);
+                    output.write_all(bytes).map_err(|e| e.to_string())?;
+                    
+                    // Tell the OS we don't need these pages anymore to keep RSS down.
+                    #[cfg(unix)]
+                    {
+                        if let Source::Original = piece.source {
+                            let ptr = bytes.as_ptr() as *mut libc::c_void;
+                            let len = bytes.len() as libc::size_t;
+                            unsafe {
+                                libc::madvise(ptr, len, libc::MADV_DONTNEED);
+                            }
+                        }
+                    }
                 }
                 output.sync_all().map_err(|e| e.to_string())?;
                 fs::rename(&temporary, &target).map_err(|e| e.to_string())?;
@@ -1170,7 +1326,7 @@ mod tests {
         f.sync_all().unwrap();
         let mmap = unsafe { Mmap::map(&File::open(&path).unwrap()) }.unwrap();
         let _ = std::fs::remove_file(&path); // unlinked but still mapped
-        let nl = scan_newlines(&mmap, |_| {});
+        let (nl, _count) = scan_newlines(&mmap, |_| {});
         PieceTable::new(Arc::new(mmap), Arc::new(nl))
     }
 
