@@ -698,6 +698,23 @@ function wireScrollbar() {
   if (!track || !thumb) return;
 
   let dragging = false;
+  let dragRequestedLine = -1;
+  let dragPending = false;
+
+  const processDrag = async () => {
+    if (dragRequestedLine === -1) {
+      dragPending = false;
+      return;
+    }
+    const line = dragRequestedLine;
+    dragRequestedLine = -1;
+    await goToLine(line);
+    if (dragRequestedLine !== -1) {
+      requestAnimationFrame(() => void processDrag());
+    } else {
+      dragPending = false;
+    }
+  };
 
   const lineFromClientY = (clientY: number) => {
     const rect = track.getBoundingClientRect();
@@ -713,7 +730,18 @@ function wireScrollbar() {
     e.preventDefault();
   });
   thumb.addEventListener("pointermove", (e) => {
-    if (dragging) void goToLine(lineFromClientY(e.clientY));
+    if (dragging) {
+      const targetLine = lineFromClientY(e.clientY);
+      // Update viewTop immediately for scrollbar visual feedback
+      viewTop = Math.min(Math.max(1, Math.round(targetLine)), maxViewTop());
+      updateScrollbar();
+
+      dragRequestedLine = targetLine;
+      if (!dragPending) {
+        dragPending = true;
+        requestAnimationFrame(() => void processDrag());
+      }
+    }
   });
   const stop = (e: PointerEvent) => {
     dragging = false;
