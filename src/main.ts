@@ -845,7 +845,7 @@ function wireEditEvents() {
 
 async function runSearch(query: string) {
   if (!currentPath) return setStatus("Open a file to search");
-  if (!query) return;
+  
   const requestId = ++searchRequestId;
   activeSearchRequestId = requestId;
   streamedNavigationRequestId = null;
@@ -853,6 +853,14 @@ async function runSearch(query: string) {
   hitIndex = -1;
   updateSearchDecorations();
   updateHitControls();
+
+  if (!query) {
+    lastQuery = "";
+    setStatus("");
+    void invoke("cancel_search");
+    return;
+  }
+
   const matchCase =
     document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
   const wholeWord =
@@ -1436,6 +1444,12 @@ function initApp() {
       e.preventDefault();
       recordHistoryEntry(REPLACE_HISTORY_KEY, replaceInput.value);
       void replaceCurrentMatch().catch((err) => setStatus(`Replace failed: ${err}`));
+    }
+  });
+
+  searchInput?.addEventListener("input", () => {
+    if (!searchInput.value) {
+      void runSearch("");
     }
   });
 

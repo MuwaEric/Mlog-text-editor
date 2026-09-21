@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tauri::{Emitter, State};
 
 /// Bytes read per parallel search/scan chunk (64 MiB) — large enough to amortize thread
@@ -578,7 +578,7 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
 #[allow(dead_code)]
 fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
-    search_document_with_progress(table, pattern, fold_case, false, None, 0)
+    search_document_with_progress(table, pattern, fold_case, false, None, None, 0).unwrap_or_default()
 }
 
 fn is_word_byte(byte: u8) -> bool {
@@ -606,13 +606,20 @@ fn search_regex_document(
     table: &PieceTable,
     regex: &regex::bytes::Regex,
     whole_word: bool,
-) -> Vec<(usize, usize)> {
+    active_search_id: Option<&AtomicU64>,
+    request_id: u64,
+) -> Result<Vec<(usize, usize)>, String> {
     let mut matches = Vec::new();
     for (piece_index, piece) in table.pieces.iter().enumerate() {
         let base = table.cum_bytes[piece_index];
         if let Source::Original = piece.source {
             // For the original mmap, we scan in chunks to keep RAM usage low.
             for s in (0..piece.length).step_by(CHUNK_SIZE) {
+                if let Some(active) = active_search_id {
+                    if active.load(Ordering::Relaxed) != request_id {
+                        return Err("search cancelled".to_string());
+                    }
+                }
                 let e = (s + CHUNK_SIZE).min(piece.length);
                 let chunk_bytes = &table.original[piece.offset + s..piece.offset + e];
                 for found in regex.find_iter(chunk_bytes) {
@@ -640,7 +647,7 @@ fn search_regex_document(
     }
     matches.sort_unstable_by_key(|&(offset, _)| offset);
     matches.dedup_by_key(|(offset, _)| *offset);
-    matches
+    Ok(matches)
 }
 
 fn search_document_with_progress(
@@ -649,11 +656,12 @@ fn search_document_with_progress(
     fold_case: bool,
     whole_word: bool,
     app: Option<&tauri::AppHandle>,
+    active_search_id: Option<&AtomicU64>,
     request_id: u64,
-) -> Vec<usize> {
+) -> Result<Vec<usize>, String> {
     let m = pattern.len();
     if m == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let overlap = m - 1;
 
@@ -666,11 +674,21 @@ fn search_document_with_progress(
 
     let bytes_scanned = Arc::new(AtomicUsize::new(0));
     let matches_found = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let total_bytes = table.total_length();
 
     let mut hits: Vec<usize> = tasks
         .par_iter()
         .flat_map(|&(i, s)| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if let Some(active) = active_search_id {
+                if active.load(Ordering::Relaxed) != request_id {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Vec::new();
+                }
+            }
             let p = table.pieces[i];
             let bytes = table.piece_bytes(&p);
             let primary_end = (s + CHUNK_SIZE).min(p.length);
@@ -722,10 +740,23 @@ fn search_document_with_progress(
         })
         .collect();
 
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("search cancelled".to_string());
+    }
+
     let total = table.total_length();
     let boundary_hits: Vec<usize> = (1..table.pieces.len())
         .into_par_iter()
         .flat_map(|i| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if let Some(active) = active_search_id {
+                if active.load(Ordering::Relaxed) != request_id {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Vec::new();
+                }
+            }
             let b = table.cum_bytes[i];
             let lo = b.saturating_sub(overlap);
             let hi = (b + overlap).min(total);
@@ -737,6 +768,10 @@ fn search_document_with_progress(
                 .collect::<Vec<_>>()
         })
         .collect();
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("search cancelled".to_string());
+    }
 
     hits.extend(boundary_hits);
     hits.sort_unstable();
@@ -753,7 +788,7 @@ fn search_document_with_progress(
             },
         );
     }
-    hits
+    Ok(hits)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -774,6 +809,7 @@ struct AppState {
     table: Arc<Mutex<Option<PieceTable>>>,
     path: Arc<Mutex<Option<PathBuf>>>,
     last_modified_ms: Arc<Mutex<u64>>,
+    active_search_id: Arc<AtomicU64>,
 }
 
 impl Default for AppState {
@@ -782,6 +818,7 @@ impl Default for AppState {
             table: Arc::new(Mutex::new(Some(empty_piece_table()))),
             path: Arc::new(Mutex::new(None)),
             last_modified_ms: Arc::new(Mutex::new(0)),
+            active_search_id: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1104,6 +1141,7 @@ async fn search_text(
     whole_word: bool,
     regex: bool,
 ) -> Result<SearchResult, String> {
+    state.active_search_id.store(request_id, Ordering::Relaxed);
     let regex_engine = if regex {
         Some(
             RegexBuilder::new(&query)
@@ -1115,30 +1153,34 @@ async fn search_text(
     } else {
         None
     };
+    let active_search_id = state.active_search_id.clone();
     with_table(&state, move |table| {
         let matches = if regex {
             search_regex_document(
                 table,
                 regex_engine.as_ref().expect("regex engine is present"),
                 whole_word,
-            )
+                Some(&active_search_id),
+                request_id,
+            )?
         } else {
             let pattern = if match_case {
                 query.as_bytes().to_vec()
             } else {
                 fold_bytes(query.as_bytes())
             };
-            search_document_with_progress(
+            let hits = search_document_with_progress(
                 table,
                 &pattern,
                 !match_case,
                 whole_word,
                 Some(&app),
+                Some(&active_search_id),
                 request_id,
-            )
-            .into_iter()
-            .map(|offset| (offset, pattern.len()))
-            .collect()
+            )?;
+            hits.into_iter()
+                .map(|offset| (offset, pattern.len()))
+                .collect()
         };
         let total_matches = matches.len();
         let hits = matches
@@ -1157,13 +1199,18 @@ async fn search_text(
                 }
             })
             .collect();
-        SearchResult {
+        Ok(SearchResult {
             total_matches,
             truncated: total_matches > MAX_REPORTED_HITS,
             hits,
-        }
+        })
     })
-    .await
+    .await?
+}
+
+#[tauri::command]
+fn cancel_search(state: State<'_, AppState>) {
+    state.active_search_id.store(0, Ordering::Relaxed);
 }
 
 /// Replaces a single match range and returns the new document line count.
@@ -1222,24 +1269,27 @@ async fn replace_all(
                 table,
                 regex_engine.as_ref().expect("regex engine is present"),
                 whole_word,
-            )
+                None,
+                0,
+            )?
         } else {
             let pattern = if match_case {
                 query.as_bytes().to_vec()
             } else {
                 fold_bytes(query.as_bytes())
             };
-            search_document_with_progress(
+            let hits = search_document_with_progress(
                 table,
                 &pattern,
                 !match_case,
                 whole_word,
                 None,
+                None,
                 0,
-            )
-            .into_iter()
-            .map(|offset| (offset, pattern.len()))
-            .collect()
+            )?;
+            hits.into_iter()
+                .map(|offset| (offset, pattern.len()))
+                .collect()
         };
 
         let replaced_count = matches.len();
@@ -1253,12 +1303,12 @@ async fn replace_all(
             }
         }
 
-        ReplaceAllResult {
+        Ok(ReplaceAllResult {
             replaced_count,
             total_lines: table.total_lines(),
-        }
+        })
     })
-    .await
+    .await?
 }
 
 /// Converts line endings across the piece table to either LF or CRLF.
@@ -1319,6 +1369,7 @@ pub fn run() {
             replace_all,
             check_file_changed,
             convert_line_endings,
+            cancel_search,
             startup_path
         ])
         .run(tauri::generate_context!())
@@ -1475,7 +1526,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            search_regex_document(&t, &regex, false),
+            search_regex_document(&t, &regex, false, None, 0).unwrap(),
             vec![(0, 5), (6, 8), (15, 5)]
         );
     }
@@ -1488,7 +1539,7 @@ mod tests {
             .unicode(false)
             .build()
             .unwrap();
-        assert_eq!(search_regex_document(&t, &regex, true), vec![(0, 5), (15, 5)]);
+        assert_eq!(search_regex_document(&t, &regex, true, None, 0).unwrap(), vec![(0, 5), (15, 5)]);
     }
 
     #[test]
@@ -1538,5 +1589,26 @@ mod tests {
 
         assert_eq!(detect_newline_format(whole(&t).as_bytes()), "LF");
         assert_eq!(whole(&t), "line 1\nline 2\nline 3\n");
+    }
+
+    #[test]
+    fn search_can_be_cancelled() {
+        let t = table("aaaa");
+        let active = AtomicU64::new(1);
+        
+        // request_id matches active -> search continues
+        let hits = search_document_with_progress(&t, b"aa", false, false, None, Some(&active), 1).unwrap();
+        assert_eq!(hits, vec![0, 1, 2]);
+
+        // request_id differs -> search cancels
+        let res = search_document_with_progress(&t, b"aa", false, false, None, Some(&active), 2);
+        assert!(res.is_err());
+        assert_eq!(res.err().unwrap(), "search cancelled");
+
+        // regex search also cancels
+        let regex = RegexBuilder::new("aa").build().unwrap();
+        let res_reg = search_regex_document(&t, &regex, false, Some(&active), 2);
+        assert!(res_reg.is_err());
+        assert_eq!(res_reg.err().unwrap(), "search cancelled");
     }
 }
