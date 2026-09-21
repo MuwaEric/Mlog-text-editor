@@ -421,6 +421,36 @@ fn utf16_len(s: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Memory management
+// ---------------------------------------------------------------------------------------------
+
+/// Advise the OS that we don't need the physical pages backing `data` right now. This keeps
+/// Resident Set Size (RSS) low after a full-file scan.
+#[allow(unused_variables)]
+fn release_memory(data: &[u8]) {
+    #[cfg(unix)]
+    {
+        let ptr = data.as_ptr() as *mut libc::c_void;
+        let len = data.len() as libc::size_t;
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_DONTNEED);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Memory::{VirtualUnlock};
+        let ptr = data.as_ptr() as *const std::ffi::c_void;
+        let len = data.len();
+        unsafe {
+            // VirtualUnlock on a range that wasn't locked is a no-op that returns an error,
+            // but it has the side effect of reducing the working set (like MADV_DONTNEED).
+            let _ = VirtualUnlock(ptr, len);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Initial newline scan over the mmap
 // ---------------------------------------------------------------------------------------------
 
@@ -464,14 +494,7 @@ fn scan_newlines(data: &[u8], mut on_chunk: impl FnMut(usize) + Send) -> (Vec<us
         on_chunk(global_count);
 
         // Tell the OS we don't need these pages anymore to keep RSS down.
-        #[cfg(unix)]
-        {
-            let ptr = chunk_data.as_ptr() as *mut libc::c_void;
-            let len = chunk_data.len() as libc::size_t;
-            unsafe {
-                libc::madvise(ptr, len, libc::MADV_DONTNEED);
-            }
-        }
+        release_memory(chunk_data);
     }
     (sparse_nls, total_count)
 }
@@ -587,23 +610,30 @@ fn search_regex_document(
     let mut matches = Vec::new();
     for (piece_index, piece) in table.pieces.iter().enumerate() {
         let base = table.cum_bytes[piece_index];
-        let bytes = table.piece_bytes(piece);
-        for found in regex.find_iter(bytes) {
-            let offset = base + found.start();
-            let length = found.end().saturating_sub(found.start());
-            if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
-                matches.push((offset, length));
+        if let Source::Original = piece.source {
+            // For the original mmap, we scan in chunks to keep RAM usage low.
+            for s in (0..piece.length).step_by(CHUNK_SIZE) {
+                let e = (s + CHUNK_SIZE).min(piece.length);
+                let chunk_bytes = &table.original[piece.offset + s..piece.offset + e];
+                for found in regex.find_iter(chunk_bytes) {
+                    let offset = base + s + found.start();
+                    let length = found.end().saturating_sub(found.start());
+                    if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
+                        matches.push((offset, length));
+                    }
+                }
+                
+                // Tell the OS we don't need these pages anymore.
+                release_memory(chunk_bytes);
             }
-        }
-        
-        // Tell the OS we don't need these pages anymore to keep RSS down.
-        #[cfg(unix)]
-        {
-            if let Source::Original = piece.source {
-                let ptr = bytes.as_ptr() as *mut libc::c_void;
-                let len = bytes.len() as libc::size_t;
-                unsafe {
-                    libc::madvise(ptr, len, libc::MADV_DONTNEED);
+        } else {
+            // Added pieces are in RAM anyway.
+            let bytes = table.piece_bytes(piece);
+            for found in regex.find_iter(bytes) {
+                let offset = base + found.start();
+                let length = found.end().saturating_sub(found.start());
+                if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
+                    matches.push((offset, length));
                 }
             }
         }
@@ -685,15 +715,8 @@ fn search_document_with_progress(
             }
             
             // Tell the OS we don't need these pages anymore to keep RSS down.
-            #[cfg(unix)]
-            {
-                if let Source::Original = p.source {
-                    let ptr = bytes[s..scan_end].as_ptr() as *mut libc::c_void;
-                    let len = bytes[s..scan_end].len() as libc::size_t;
-                    unsafe {
-                        libc::madvise(ptr, len, libc::MADV_DONTNEED);
-                    }
-                }
+            if let Source::Original = p.source {
+                release_memory(&bytes[s..scan_end]);
             }
             local_hits
         })
@@ -957,15 +980,8 @@ async fn save_file(
                     output.write_all(bytes).map_err(|e| e.to_string())?;
                     
                     // Tell the OS we don't need these pages anymore to keep RSS down.
-                    #[cfg(unix)]
-                    {
-                        if let Source::Original = piece.source {
-                            let ptr = bytes.as_ptr() as *mut libc::c_void;
-                            let len = bytes.len() as libc::size_t;
-                            unsafe {
-                                libc::madvise(ptr, len, libc::MADV_DONTNEED);
-                            }
-                        }
+                    if let Source::Original = piece.source {
+                        release_memory(bytes);
                     }
                 }
                 output.sync_all().map_err(|e| e.to_string())?;
