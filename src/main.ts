@@ -139,6 +139,7 @@ function savePrefs() {
 
 function applyPrefs() {
   monaco.editor.setTheme(prefs.theme);
+  if (!editor) return;
   editor.updateOptions({
     fontSize: prefs.fontSize,
     fontFamily: prefs.fontFamily.trim() || defaultFontFamily,
@@ -191,7 +192,7 @@ interface SearchProgress {
   hits: SearchHit[];
 }
 
-let editor: monaco.editor.IStandaloneCodeEditor;
+let editor: monaco.editor.IStandaloneCodeEditor | null = null;
 let totalLines = 1;
 let windowStart = 1; // file line shown as model line 1
 let windowCount = 0; // lines currently in the model
@@ -327,6 +328,15 @@ function updateDocumentState() {
   const hasFile = Boolean(currentPath);
   const isReadOnly = prefs.readOnly;
 
+  const welcomeView = document.querySelector<HTMLElement>("#welcome-view");
+  if (welcomeView) {
+    if (hasModel) {
+      welcomeView.classList.add("hidden");
+    } else {
+      welcomeView.classList.remove("hidden");
+    }
+  }
+
   if (save) save.disabled = !hasModel || !dirty || isReadOnly;
   if (saveAs) saveAs.disabled = !hasModel || isReadOnly;
   if (gotoBtn) gotoBtn.disabled = !hasFile;
@@ -449,7 +459,7 @@ function wireGotoDialog() {
         if (!Number.isSafeInteger(offset) || offset < 0) return setStatus("Invalid byte offset");
         const [line, column] = await invoke<[number, number]>("position_at_byte", { offset });
         await goToLine(line);
-        editor.setPosition({ lineNumber: toModelLine(line), column });
+        editor?.setPosition({ lineNumber: toModelLine(line), column });
         close();
         return;
       }
@@ -460,7 +470,7 @@ function wireGotoDialog() {
         return setStatus("Invalid line or column");
       }
       await goToLine(line);
-      editor.setPosition({ lineNumber: toModelLine(line), column });
+      editor?.setPosition({ lineNumber: toModelLine(line), column });
       close();
     })().catch((err) => setStatus(`Navigation failed: ${err}`));
   };
@@ -500,7 +510,7 @@ function updatePosition(modelLine: number, column: number) {
   if (!position) return;
   const fileLine = toFileLine(modelLine);
   position.textContent = `Ln ${fileLine.toLocaleString()}, Col ${column.toLocaleString()}`;
-  if (!currentPath) return;
+  if (!currentPath || !editor) return;
   const requestId = ++positionRequestId;
   void invoke<number>("byte_offset", { line: fileLine, column })
     .then((offset) => {
@@ -512,11 +522,13 @@ function updatePosition(modelLine: number, column: number) {
 }
 
 function lineHeight(): number {
+  if (!editor) return 20;
   return editor.getOption(monaco.editor.EditorOption.lineHeight);
 }
 
 /** First and last *model* lines on screen. Reflects wrapping, unlike scrollTop arithmetic. */
 function visibleModelRange(): { start: number; end: number } | null {
+  if (!editor) return null;
   const ranges = editor.getVisibleRanges();
   if (!ranges.length) return null;
   return {
@@ -528,6 +540,7 @@ function visibleModelRange(): { start: number; end: number } | null {
 function linesPerScreen(): number {
   const r = visibleModelRange();
   if (r) return Math.max(1, r.end - r.start + 1);
+  if (!editor) return 20;
   return Math.max(1, Math.floor(editor.getLayoutInfo().height / lineHeight()));
 }
 
@@ -536,8 +549,54 @@ function maxViewTop(): number {
 }
 
 /** Loads a fresh window of lines into the model, starting at `start`. */
-async function anchorWindow(start: number) {
+let anchorWindow = async (start: number) => {
   if (!currentPath) return;
+  
+  if (!editor) {
+    const container = document.querySelector<HTMLDivElement>("#editor-container");
+    if (!container) return;
+    editor = monaco.editor.create(container, {
+      value: "",
+      language: "plaintext",
+      automaticLayout: true,
+      scrollBeyondLastLine: false,
+      scrollbar: { vertical: "hidden", verticalScrollbarSize: 0 },
+      hover: { showLongLineWarning: false },
+      maxTokenizationLineLength: 10000,
+    });
+    
+    editor.onDidScrollChange(() => {
+      if (syncing) return;
+      const r = visibleModelRange();
+      if (!r) return;
+      viewTop = toFileLine(r.start);
+      if (currentPath) {
+        const pos = editor?.getPosition();
+        writeLineCache(currentPath, {
+          line: viewTop,
+          column: pos ? pos.column : 1,
+        });
+      }
+      updateScrollbar();
+      void maybeReanchor();
+    });
+    editor.onDidLayoutChange(() => updateScrollbar());
+    editor.onDidChangeCursorPosition(({ position }) => {
+      if (!syncing) {
+        updatePosition(position.lineNumber, position.column);
+        if (currentPath) {
+          writeLineCache(currentPath, {
+            line: viewTop,
+            column: position.column,
+          });
+        }
+      }
+    });
+    
+    wireEditEvents();
+    applyPrefs();
+  }
+
   const maxStart = Math.max(1, totalLines - windowLines() + 1);
   const newStart = Math.min(Math.max(1, Math.round(start)), maxStart);
   const end = Math.min(newStart + windowLines() - 1, totalLines);
@@ -550,7 +609,7 @@ async function anchorWindow(start: number) {
   // Every line arrives newline-terminated; keeping the last one would add a phantom empty line.
   const text = end < totalLines ? raw.replace(/\n$/, "") : raw;
 
-  const model = editor.getModel();
+  const model = editor?.getModel();
   if (!model) return;
   syncing = true;
   model.setValue(text);
@@ -561,6 +620,7 @@ async function anchorWindow(start: number) {
 }
 
 function scrollToViewTop() {
+  if (!editor) return;
   syncing = true;
   // getTopForLineNumber accounts for wrapped lines; scrollTop/lineHeight would not.
   const modelLine = Math.min(
@@ -699,7 +759,7 @@ async function openFile(path: string) {
 
   const modelLine = toModelLine(targetFileLine);
   if (modelLine >= 1 && modelLine <= windowCount) {
-    editor.setPosition({ lineNumber: modelLine, column: targetCol });
+    editor?.setPosition({ lineNumber: modelLine, column: targetCol });
   }
 
   const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} · ${meta.encoding}`;
@@ -715,6 +775,7 @@ async function openFile(path: string) {
  * lines are window-relative, so both are translated before crossing the IPC boundary.
  */
 function wireEditEvents() {
+  if (!editor) return;
   editor.onDidChangeModelContent((e) => {
     if (syncing || prefs.readOnly) return;
 
@@ -744,7 +805,7 @@ function wireEditEvents() {
         .catch((err) => setStatus(`Edit failed: ${err}`));
     }
 
-    const model = editor.getModel();
+    const model = editor?.getModel();
     if (model) windowCount = model.getLineCount();
     updateScrollbar();
     dirty = true;
@@ -945,8 +1006,8 @@ async function gotoHit(index: number) {
       hit.end_column
     );
     syncing = true;
-    editor.setSelection(range);
-    editor.revealRangeInCenter(range, monaco.editor.ScrollType.Immediate);
+    editor?.setSelection(range);
+    editor?.revealRangeInCenter(range, monaco.editor.ScrollType.Immediate);
     syncing = false;
     updatePosition(startLine, hit.column);
   }
@@ -1129,6 +1190,7 @@ function initApp() {
   };
 
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
+  document.querySelector("#welcome-open-btn")?.addEventListener("click", chooseFile);
   document.querySelector("#prefs-btn")?.addEventListener("click", openPreferences);
   wirePreferences();
   wireGotoDialog();
@@ -1147,52 +1209,13 @@ function initApp() {
 
   loadPrefs();
 
-  editor = monaco.editor.create(container, {
-    value: "",
-    language: "plaintext",
-    automaticLayout: true,
-    scrollBeyondLastLine: false,
-    scrollbar: { vertical: "hidden", verticalScrollbarSize: 0 },
-    // Everything loads as plaintext, so Monaco's "tokenization skipped on long lines" and
-    // "rendering paused" hovers warn about work this app never does.
-    hover: { showLongLineWarning: false },
-    maxTokenizationLineLength: 10000,
-  });
-
+  // Defer editor creation until a file is opened.
   // Captured before any preference is applied, so "default" font can be restored later.
-  defaultFontFamily = editor.getOption(monaco.editor.EditorOption.fontFamily);
+  // We'll get this from a temporary dummy editor if needed, or just hardcode a common default.
+  defaultFontFamily = "Menlo, Monaco, 'Courier New', monospace";
   applyPrefs();
   syncPrefControls();
 
-  editor.onDidScrollChange(() => {
-    if (syncing) return;
-    const r = visibleModelRange();
-    if (!r) return;
-    viewTop = toFileLine(r.start);
-    if (currentPath) {
-      const pos = editor?.getPosition();
-      writeLineCache(currentPath, {
-        line: viewTop,
-        column: pos ? pos.column : 1,
-      });
-    }
-    updateScrollbar();
-    void maybeReanchor();
-  });
-  editor.onDidLayoutChange(() => updateScrollbar());
-  editor.onDidChangeCursorPosition(({ position }) => {
-    if (!syncing) {
-      updatePosition(position.lineNumber, position.column);
-      if (currentPath) {
-        writeLineCache(currentPath, {
-          line: viewTop,
-          column: position.column,
-        });
-      }
-    }
-  });
-
-  wireEditEvents();
   wireScrollbar();
   updateDocumentState();
   updateHistoryControls();
@@ -1219,57 +1242,84 @@ function initApp() {
   });
   document.querySelector("#undo-btn")?.addEventListener("click", () => {
     closeActionsMenu();
-    editor.focus();
-    const model = editor.getModel() as any;
+    editor?.focus();
+    const model = editor?.getModel() as any;
     if (typeof model?.undo === "function") {
       model.undo();
-    } else {
+    } else if (editor) {
       editor.trigger("ui", "undo", null);
     }
     updateHistoryControls();
   });
   document.querySelector("#redo-btn")?.addEventListener("click", () => {
     closeActionsMenu();
-    editor.focus();
-    const model = editor.getModel() as any;
+    editor?.focus();
+    const model = editor?.getModel() as any;
     if (typeof model?.redo === "function") {
       model.redo();
-    } else {
+    } else if (editor) {
       editor.trigger("ui", "redo", null);
     }
     updateHistoryControls();
   });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-    void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
-  });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, chooseFile);
-  editor.addCommand(
-    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS,
-    () => {
-      void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
-    }
-  );
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyG, () => {
-    goToPosition();
-  });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => {
-    const model = editor.getModel() as any;
-    if (typeof model?.undo === "function") {
-      model.undo();
-    } else {
-      editor.trigger("ui", "undo", null);
-    }
-    updateHistoryControls();
-  });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => {
-    const model = editor.getModel() as any;
-    if (typeof model?.redo === "function") {
-      model.redo();
-    } else {
-      editor.trigger("ui", "redo", null);
-    }
-    updateHistoryControls();
-  });
+  const focusSearch = () => {
+    if (!editor) return;
+    searchInput?.focus();
+    searchInput?.select();
+  };
+  const focusReplace = () => {
+    if (!editor) return;
+    replaceInput?.focus();
+    replaceInput?.select();
+  };
+  const noop = () => {};
+
+  const setupKeybindings = (ed: monaco.editor.IStandaloneCodeEditor) => {
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
+    });
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, chooseFile);
+    ed.addCommand(
+      monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS,
+      () => {
+        void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
+      }
+    );
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyG, () => {
+      goToPosition();
+    });
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => {
+      const model = ed.getModel() as any;
+      if (typeof model?.undo === "function") {
+        model.undo();
+      } else {
+        ed.trigger("ui", "undo", null);
+      }
+      updateHistoryControls();
+    });
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => {
+      const model = ed.getModel() as any;
+      if (typeof model?.redo === "function") {
+        model.redo();
+      } else {
+        ed.trigger("ui", "redo", null);
+      }
+      updateHistoryControls();
+    });
+
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, focusSearch);
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusReplace);
+    ed.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
+    ed.addCommand(
+      monaco.KeyMod.Shift | monaco.KeyCode.F3,
+      () => void gotoHit(hitIndex - 1)
+    );
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.F3, noop);
+    ed.addCommand(
+      monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.F3,
+      noop
+    );
+  };
 
   void listen<{ bytes_scanned: number; total_bytes: number }>(
     "scan-progress",
@@ -1325,27 +1375,17 @@ function initApp() {
 
   // Monaco has no option to disable its find widget, and it would only ever search the loaded
   // window, so its keybindings are captured and routed to the file-wide search instead.
-  const focusSearch = () => {
-    searchInput?.focus();
-    searchInput?.select();
+  
+  // Intercept anchorWindow to setup keybindings on first creation
+  const originalAnchorWindow = anchorWindow;
+  const newAnchorWindow = async (start: number) => {
+    const isFirstTime = !editor;
+    await originalAnchorWindow(start);
+    if (isFirstTime && editor) {
+      setupKeybindings(editor);
+    }
   };
-  const focusReplace = () => {
-    replaceInput?.focus();
-    replaceInput?.select();
-  };
-  const noop = () => {};
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, focusSearch);
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusReplace);
-  editor.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
-  editor.addCommand(
-    monaco.KeyMod.Shift | monaco.KeyCode.F3,
-    () => void gotoHit(hitIndex - 1)
-  );
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.F3, noop);
-  editor.addCommand(
-    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.F3,
-    noop
-  );
+  anchorWindow = newAnchorWindow;
 
   document.querySelector("#search-btn")?.addEventListener("click", () => {
     const query = searchInput?.value ?? "";
