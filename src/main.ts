@@ -313,9 +313,21 @@ function updateSearchDecorations() {
   );
 }
 
-function setStatus(message: string) {
+function setStatus(message: string, isPersistentMetadata: boolean = false) {
   const el = document.querySelector<HTMLElement>("#status");
-  if (el) el.textContent = message;
+  if (el) {
+    if (isPersistentMetadata) {
+      el.textContent = "";
+    } else {
+      el.textContent = message;
+    }
+  }
+
+  const prefEl = document.querySelector<HTMLElement>("#pref-metadata");
+  if (prefEl) prefEl.textContent = message || "No file open";
+
+  const locationEl = document.querySelector<HTMLElement>("#pref-location");
+  if (locationEl) locationEl.textContent = currentPath || "No file open";
 }
 
 function updateDocumentState() {
@@ -377,12 +389,13 @@ async function saveDocument(path: string | null = currentPath) {
   clearRecoveryState();
   updateDocumentState();
   updateTabsUI();
-  setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} saved`);
+  setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} saved`, true);
 }
 
 async function convertLineEndingsTo(target: "LF" | "CRLF") {
   if (!currentPath) {
-    return setStatus("No file open to convert line endings");
+    setStatus("No file open to convert line endings", false);
+    return;
   }
   setStatus(`Converting line endings to ${target}…`);
   await pendingEdits;
@@ -394,7 +407,7 @@ async function convertLineEndingsTo(target: "LF" | "CRLF") {
   await anchorWindow(viewTop);
   scrollToViewTop();
   updateScrollbar();
-  setStatus(`Converted line endings to ${meta.newline} (${meta.total_lines.toLocaleString()} lines)`);
+  setStatus(`Converted line endings to ${meta.newline} (${meta.total_lines.toLocaleString()} lines)`, true);
 }
 
 function wireExternalChangeDialog() {
@@ -457,7 +470,10 @@ function wireGotoDialog() {
     void (async () => {
       if (value.startsWith("byte:")) {
         const offset = Number(value.slice(5).trim());
-        if (!Number.isSafeInteger(offset) || offset < 0) return setStatus("Invalid byte offset");
+        if (!Number.isSafeInteger(offset) || offset < 0) {
+          setStatus("Invalid byte offset", false);
+          return;
+        }
         const [line, column] = await invoke<[number, number]>("position_at_byte", { offset });
         await goToLine(line);
         editor?.setPosition({ lineNumber: toModelLine(line), column });
@@ -468,12 +484,13 @@ function wireGotoDialog() {
       const line = parts[0];
       const column = parts.length > 1 ? parts[1] : 1;
       if (!Number.isSafeInteger(line) || line < 1 || !Number.isSafeInteger(column) || column < 1) {
-        return setStatus("Invalid line or column");
+        setStatus("Invalid line or column", false);
+        return;
       }
       await goToLine(line);
       editor?.setPosition({ lineNumber: toModelLine(line), column });
       close();
-    })().catch((err) => setStatus(`Navigation failed: ${err}`));
+    })().catch((err) => setStatus(`Navigation failed: ${err}`, false));
   };
 
   submitBtn?.addEventListener("click", submit);
@@ -759,7 +776,7 @@ function wireScrollbar() {
 // --- file loading -----------------------------------------------------------------------------
 
 async function openFile(path: string) {
-  setStatus("Opening & scanning line offsets…");
+  setStatus("Opening & scanning line offsets…", false);
   const meta = await invoke<FileMeta>("open_file", { path });
   totalLines = meta.total_lines;
   windowStart = 1;
@@ -804,7 +821,8 @@ async function openFile(path: string) {
   setStatus(
     hasUnsavedRecovery
       ? `${baseStatus} (⚠️ previous session had unsaved changes)`
-      : baseStatus
+      : baseStatus,
+    true
   );
 }
 
@@ -862,6 +880,16 @@ async function switchTab(id: string) {
   updateScrollbar();
   updateHitControls();
   updateSearchDecorations();
+
+  if (currentPath) {
+    const meta = await invoke<FileMeta>("open_file", { path: currentPath });
+    const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} · ${meta.encoding}`;
+    setStatus(baseStatus, true);
+    const pos = editor?.getPosition();
+    if (pos) updatePosition(pos.lineNumber, pos.column);
+  } else {
+    setStatus("No file open", true);
+  }
 }
 
 async function newTab() {
@@ -901,6 +929,8 @@ async function closeTab(id: string) {
         updateScrollbar();
         updateHitControls();
         updateSearchDecorations();
+        currentPath = null;
+        setStatus("No file open", true);
     }
   } else {
     updateTabsUI();
@@ -956,7 +986,10 @@ function wireEditEvents() {
 }
 
 async function runSearch(query: string) {
-  if (!currentPath) return setStatus("Open a file to search");
+  if (!currentPath) {
+    setStatus("Open a file to search", false);
+    return;
+  }
   
   const requestId = ++searchRequestId;
   activeSearchRequestId = requestId;
@@ -1056,15 +1089,27 @@ function jumpToResultInput() {
 }
 
 async function replaceCurrentMatch() {
-  if (prefs.readOnly) return setStatus("Cannot replace: editor is in read-only mode");
-  if (!currentPath) return setStatus("Open a file first");
+  if (prefs.readOnly) {
+    setStatus("Cannot replace: editor is in read-only mode", false);
+    return;
+  }
+  if (!currentPath) {
+    setStatus("Open a file first", false);
+    return;
+  }
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
   const query = searchInput?.value ?? "";
-  if (!query) return setStatus("Enter search text to replace");
+  if (!query) {
+    setStatus("Enter search text to replace", false);
+    return;
+  }
 
   if (hitIndex < 0 || hitIndex >= hits.length) {
     await runSearch(query);
-    if (hits.length === 0) return setStatus("No matches found to replace");
+    if (hits.length === 0) {
+      setStatus("No matches found to replace", false);
+      return;
+    }
   }
 
   const hit = hits[hitIndex];
@@ -1093,12 +1138,20 @@ async function replaceCurrentMatch() {
 }
 
 async function replaceAllMatches() {
-  if (prefs.readOnly) return setStatus("Cannot replace: editor is in read-only mode");
-  if (!currentPath) return setStatus("Open a file first");
+  if (prefs.readOnly) {
+    setStatus("Cannot replace: editor is in read-only mode", false);
+    return;
+  }
+  if (!currentPath) {
+    setStatus("Open a file first", false);
+    return;
+  }
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
-  const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
   const query = searchInput?.value ?? "";
-  if (!query) return setStatus("Enter search text to replace all");
+  if (!query) {
+    setStatus("Enter search text to replace all", false);
+    return;
+  }
   const replacement = replaceInput?.value ?? "";
 
   const matchCase =

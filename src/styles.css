@@ -533,6 +533,20 @@ body {
   font-size: 0.9em;
 }
 
+.metadata-section {
+  margin-top: 1.25em;
+  padding-top: 0.75em;
+  border-top: 1px solid #ddd;
+}
+
+.metadata-display {
+  font-size: 0.9em;
+  opacity: 0.8;
+  max-width: 25em;
+  text-align: right;
+  word-break: break-all;
+}
+
 .pref-row input[type="number"],
 .pref-row select {
   width: 8em;
