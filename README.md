@@ -11,6 +11,45 @@ MLog Text Editor is a high-performance text editor built with Tauri, Rust, and T
 - **Instant Cancellation:** Stop search operations immediately when clearing the form or starting a new query.
 - **Concurrent Processing:** Read-only operations (like searching) run in parallel, ensuring the UI remains responsive.
 
+## Installation
+
+For users who want to use MLog Text Editor without building it from source:
+
+### Linux (Debian/Ubuntu)
+
+#### Option 1: Direct Download (Easiest)
+1. Download the latest `.deb` package from the [Releases](https://github.com/MuwaEric/Mlog-text-editor/releases) page.
+2. Install it using `apt` (recommended, as it handles dependencies automatically by fetching them from official repositories):
+   ```bash
+   sudo apt install ./MLog-Text-Editor_0.1.0_amd64.deb
+   ```
+3. Alternatively, use `dpkg` (Note: `dpkg` does not resolve dependencies automatically, so you must follow up with `apt install -f` if it fails):
+   ```bash
+   sudo dpkg -i MLog-Text-Editor_0.1.0_amd64.deb
+   sudo apt install -f  # Fix dependency issues by installing missing requirements
+   ```
+
+#### Option 2: Using a PPA or Custom Repository
+To install and receive updates via `sudo apt install mlog-text-editor`, you can add the MLog repository to your system:
+
+```bash
+# 1. Add the repository GPG key
+curl -fsSL https://proget.example.com/api/gpg/mlog | sudo gpg --dearmor -o /etc/apt/keyrings/mlog.gpg
+
+# 2. Add the repository to your sources list
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/mlog.gpg] https://proget.example.com/mlog-apt/ stable main" | sudo tee /etc/apt/sources.list.d/mlog.list
+
+# 3. Update and install
+sudo apt update
+sudo apt install mlog-text-editor
+```
+*(Note: Replace URLs with your actual repository endpoints if you set up a custom PPA or hosting service.)*
+
+#### Option 3: AppImage (Portable)
+1. Download the `.AppImage` file from the [Releases](https://github.com/MuwaEric/Mlog-text-editor/releases) page.
+2. Make it executable: `chmod +x MLog-Text-Editor_0.1.0_amd64.AppImage`
+3. Run it!
+
 ---
 
 ##  User Guide
