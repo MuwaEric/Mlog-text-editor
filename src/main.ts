@@ -327,7 +327,6 @@ function updateDocumentState() {
   const convertLf = document.querySelector<HTMLButtonElement>("#convert-lf-btn");
   const replaceBtn = document.querySelector<HTMLButtonElement>("#replace-btn");
   const replaceAllBtn = document.querySelector<HTMLButtonElement>("#replace-all-btn");
-  const name = document.querySelector<HTMLElement>("#file-name");
 
   const hasModel = !!editor?.getModel();
   const hasFile = Boolean(currentPath);
@@ -350,16 +349,6 @@ function updateDocumentState() {
   if (convertLf) convertLf.disabled = !hasFile || isReadOnly;
   if (replaceBtn) replaceBtn.disabled = !hasFile || isReadOnly;
   if (replaceAllBtn) replaceAllBtn.disabled = !hasFile || isReadOnly;
-  if (name) {
-    const readOnlyTag = isReadOnly ? " [Read-Only]" : "";
-    if (hasFile) {
-      name.textContent = `${currentPath!.split("/").pop() ?? currentPath}${dirty ? " *" : ""}${readOnlyTag}`;
-    } else if (hasModel) {
-      name.textContent = `Untitled${dirty ? " *" : ""}${readOnlyTag}`;
-    } else {
-      name.textContent = `No file open`;
-    }
-  }
 }
 
 function updateHistoryControls() {
@@ -831,8 +820,9 @@ function updateTabsUI() {
     const el = document.createElement("div");
     el.className = `tab${tab.id === currentTabId ? " active" : ""}`;
     const name = tab.path ? tab.path.split("/").pop() ?? tab.path : "Untitled";
+    const readOnlyTag = prefs.readOnly ? " [RO]" : "";
     el.innerHTML = `
-      <span class="tab-name">${name}${tab.dirty ? " *" : ""}</span>
+      <span class="tab-name">${name}${tab.dirty ? " *" : ""}${readOnlyTag}</span>
       <span class="tab-close" title="Close Tab">✕</span>
     `;
     el.addEventListener("click", (e) => {
@@ -1319,10 +1309,16 @@ function initApp() {
   const container = document.querySelector<HTMLDivElement>("#editor-container");
   if (!container) return;
 
-  const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
+  const menuBtn = document.querySelector<HTMLButtonElement>("#menu-btn");
+  const actionsPopover = document.querySelector<HTMLDivElement>("#actions-popover");
 
   const closeActionsMenu = () => {
-    if (actionsMenu) actionsMenu.open = false;
+    if (actionsPopover) actionsPopover.classList.add("hidden");
+  };
+
+  const toggleActionsMenu = (e: MouseEvent) => {
+    e.stopPropagation();
+    actionsPopover?.classList.toggle("hidden");
   };
 
   const chooseFile = () => {
@@ -1347,6 +1343,7 @@ function initApp() {
     openPreferencesDialog();
   };
 
+  document.querySelector("#menu-btn")?.addEventListener("click", (e) => toggleActionsMenu(e as MouseEvent));
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
   document.querySelector("#close-btn")?.addEventListener("click", closeFile);
   document.querySelector("#welcome-open-btn")?.addEventListener("click", chooseFile);
@@ -1357,13 +1354,13 @@ function initApp() {
   wireExternalChangeDialog();
 
   window.addEventListener("click", (event) => {
-    if (actionsMenu?.open && !actionsMenu.contains(event.target as Node)) {
-      actionsMenu.open = false;
+    if (!actionsPopover?.classList.contains("hidden") && !actionsPopover?.contains(event.target as Node) && event.target !== menuBtn) {
+      actionsPopover?.classList.add("hidden");
     }
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && actionsMenu?.open) {
-      actionsMenu.open = false;
+    if (event.key === "Escape" && !actionsPopover?.classList.contains("hidden")) {
+      actionsPopover?.classList.add("hidden");
     }
     if ((event.ctrlKey || event.metaKey) && event.key === "t") {
       event.preventDefault();

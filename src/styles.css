@@ -32,110 +32,163 @@ body {
   flex-direction: column;
 }
 
-#toolbar,
+#header-bar,
 #findbar {
   padding: 0.45em 0.6em;
-  background: #1e1e1e;
+  background: #242424;
   color: #eee;
   flex: none;
 }
 
-#toolbar {
+#header-bar {
   display: flex;
   align-items: center;
-  gap: 0.6em;
+  justify-content: space-between;
+  height: 46px;
   position: relative;
   z-index: 100;
-  border-bottom: 1px solid #000;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.4);
+  background: #242424;
+  padding: 0 6px;
 }
 
-#findbar {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4em;
-  border-top: 1px solid #000;
-}
-
-#tab-bar {
+#header-left, #header-right {
   display: flex;
   align-items: center;
-  background: #252525;
-  border-bottom: 1px solid #000;
-  height: 35px;
-  padding: 0 5px;
-  gap: 5px;
+  min-width: 46px;
+}
+
+#header-center {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  height: 100%;
+  overflow: hidden;
+  max-width: 60%;
+}
+
+.header-btn {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #eee;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.header-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.header-btn:active {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.header-btn .icon {
+  font-size: 1.2em;
 }
 
 #tabs-container {
   display: flex;
-  flex: 1;
-  overflow-x: auto;
   gap: 2px;
+  align-items: center;
   height: 100%;
-  align-items: flex-end;
-}
-
-#tabs-container::-webkit-scrollbar {
-  height: 4px;
-}
-
-#tabs-container::-webkit-scrollbar-thumb {
-  background: #444;
 }
 
 .tab {
   display: flex;
   align-items: center;
-  background: #2d2d2d;
+  background: transparent;
   color: #aaa;
-  padding: 5px 10px;
-  border-radius: 4px 4px 0 0;
-  font-size: 12px;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-size: 13px;
   min-width: 100px;
-  max-width: 200px;
+  max-width: 180px;
   cursor: pointer;
   user-select: none;
-  height: 28px;
+  height: 34px;
   position: relative;
   gap: 8px;
+  transition: background 0.2s, color 0.2s;
 }
 
 .tab:hover {
-  background: #333;
+  background: rgba(255, 255, 255, 0.05);
   color: #ccc;
 }
 
 .tab.active {
-  background: #1e1e1e;
+  background: #353535;
   color: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.tab .tab-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tab .tab-close {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
   font-size: 10px;
+  opacity: 0.6;
 }
 
 .tab .tab-close:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.15);
+  opacity: 1;
 }
 
-#new-tab-btn {
-  background: transparent;
-  border: none;
-  color: #aaa;
-  cursor: pointer;
-  font-size: 18px;
-  padding: 0 10px;
-  height: 30px;
+#popover-anchor {
+  position: relative;
 }
 
-#new-tab-btn:hover {
-  color: #fff;
+.popover {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: -6px;
+  z-index: 10000;
+  min-width: 19em;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: #2d2d2d;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  transition: opacity 0.2s, transform 0.2s;
+  transform-origin: top right;
+}
+
+.popover.hidden {
+  display: none;
+  opacity: 0;
+  transform: scale(0.95);
+}
+
+.popover-arrow {
+  position: absolute;
+  top: -6px;
+  right: 14px;
+  width: 12px;
+  height: 12px;
+  background: #2d2d2d;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  transform: rotate(45deg);
 }
 
 .find-row {
@@ -149,11 +202,21 @@ body {
 #findbar input[type="text"],
 #search-input,
 #replace-input {
-  padding: 0.3em 0.5em;
-  border: 1px solid #ffffff26;
-  border-radius: 4px;
-  background: #2b2b2b;
+  padding: 0.35em 0.7em;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: #353535;
   color: #eee;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+#toolbar input:focus,
+#findbar input[type="text"]:focus,
+#search-input:focus,
+#replace-input:focus {
+  border-color: #3584e4;
+  background: #3d3d3d;
+  outline: none;
 }
 
 #search-input,
@@ -170,19 +233,33 @@ body {
 #toolbar button,
 #findbar button,
 .menu-btn {
-  padding: 0.3em 0.7em;
-  border: 1px solid #ffffff26;
-  border-radius: 4px;
-  background: #333;
+  padding: 0.4em 0.8em;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: #353535;
   color: #eee;
   cursor: pointer;
   user-select: none;
   -webkit-user-select: none;
+  transition: background 0.2s, border-color 0.2s;
 }
 
 #toolbar button:hover,
 #findbar button:hover {
   background: #3d3d3d;
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+#toolbar button:active,
+#findbar button:active {
+  background: #454545;
+}
+
+#toolbar button:disabled,
+#findbar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: #2d2d2d;
 }
 
 #actions-menu {
@@ -221,40 +298,31 @@ body {
 }
 
 .actions-list {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  z-index: 10000;
   display: flex;
-  min-width: 19em;
   flex-direction: column;
   gap: 2px;
-  padding: 0.4em;
-  border: 1px solid #ffffff26;
-  border-radius: 8px;
-  background: #252525;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
 }
 
 .actions-list .menu-item {
   display: grid;
   grid-template-columns: 1.5em 1fr auto;
   align-items: center;
-  gap: 0.6em;
+  gap: 0.8em;
   width: 100%;
-  padding: 0.4em 0.6em;
+  padding: 0.6em 0.8em;
   border: none;
-  border-radius: 4px;
+  border-radius: 6px;
   background: transparent;
   color: #eee;
-  font-size: 0.9em;
+  font-size: 0.95em;
   text-align: left;
   cursor: pointer;
   box-shadow: none;
+  transition: background 0.2s;
 }
 
 .actions-list .menu-item:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .actions-list .menu-item:disabled {

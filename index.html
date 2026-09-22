@@ -10,61 +10,61 @@
 
   <body>
     <div id="boot-status" aria-live="polite">Please wait…</div>
-    <div id="toolbar">
-      <details id="actions-menu" class="actions-menu">
-        <summary id="menu-summary" title="Application menu">☰</summary>
-        <div class="actions-list">
-          <button id="open-btn" class="menu-item" type="button" title="Open File (Ctrl+O)">
-            <span class="menu-icon">↗</span><span>Open File…</span><span class="menu-shortcut">Ctrl+O</span>
+    <div id="header-bar">
+      <div id="header-left">
+        <button id="new-tab-btn" class="header-btn" title="New Tab (Ctrl+T)">
+          <span class="icon">+</span>
+        </button>
+      </div>
+      <div id="header-center">
+        <div id="tabs-container"></div>
+      </div>
+      <div id="header-right">
+        <div id="popover-anchor">
+          <button id="menu-btn" class="header-btn" title="Application menu">
+            <span class="icon">☰</span>
           </button>
-          <button id="close-btn" class="menu-item" type="button" disabled title="Close File">
-            <span class="menu-icon">✕</span><span>Close File</span><span class="menu-shortcut"></span>
-          </button>
-          <div class="menu-separator"></div>
-          <button id="save-btn" class="menu-item" type="button" disabled title="Save (Ctrl+S)">
-            <span class="menu-icon">↓</span><span>Save</span><span class="menu-shortcut">Ctrl+S</span>
-          </button>
-          <button id="save-as-btn" class="menu-item" type="button" disabled title="Save As (Ctrl+Shift+S)">
-            <span class="menu-icon">⇩</span><span>Save As…</span><span class="menu-shortcut">Ctrl+Shift+S</span>
-          </button>
-          <div class="menu-separator"></div>
-          <button id="undo-btn" class="menu-item" type="button" disabled title="Undo (Ctrl+Z)">
-            <span class="menu-icon">↶</span><span>Undo</span><span class="menu-shortcut">Ctrl+Z</span>
-          </button>
-          <button id="redo-btn" class="menu-item" type="button" disabled title="Redo (Ctrl+Y)">
-            <span class="menu-icon">↷</span><span>Redo</span><span class="menu-shortcut">Ctrl+Y</span>
-          </button>
-          <button id="goto-btn" class="menu-item" type="button" disabled title="Go To line or byte (Ctrl+G)">
-            <span class="menu-icon">⌖</span><span>Go To…</span><span class="menu-shortcut">Ctrl+G</span>
-          </button>
-          <div class="menu-separator"></div>
-          <button id="convert-crlf-btn" class="menu-item" type="button" disabled title="Convert line endings to CRLF (Windows)">
-            <span class="menu-icon">↵</span><span>Convert to CRLF</span><span class="menu-shortcut"></span>
-          </button>
-          <button id="convert-lf-btn" class="menu-item" type="button" disabled title="Convert line endings to LF (Unix/Linux)">
-            <span class="menu-icon">↓</span><span>Convert to LF</span><span class="menu-shortcut"></span>
-          </button>
-          <div class="menu-separator"></div>
-          <button id="prefs-btn" class="menu-item" type="button" title="Preferences">
-            <span class="menu-icon">⚙</span><span>Preferences…</span><span class="menu-shortcut"></span>
-          </button>
+          <div id="actions-popover" class="popover hidden">
+            <div class="popover-arrow"></div>
+            <div class="actions-list">
+              <button id="open-btn" class="menu-item" type="button" title="Open File (Ctrl+O)">
+                <span class="menu-icon">↗</span><span>Open File…</span><span class="menu-shortcut">Ctrl+O</span>
+              </button>
+              <button id="close-btn" class="menu-item" type="button" disabled title="Close File">
+                <span class="menu-icon">✕</span><span>Close File</span><span class="menu-shortcut"></span>
+              </button>
+              <div class="menu-separator"></div>
+              <button id="save-btn" class="menu-item" type="button" disabled title="Save (Ctrl+S)">
+                <span class="menu-icon">↓</span><span>Save</span><span class="menu-shortcut">Ctrl+S</span>
+              </button>
+              <button id="save-as-btn" class="menu-item" type="button" disabled title="Save As (Ctrl+Shift+S)">
+                <span class="menu-icon">⇩</span><span>Save As…</span><span class="menu-shortcut">Ctrl+Shift+S</span>
+              </button>
+              <div class="menu-separator"></div>
+              <button id="undo-btn" class="menu-item" type="button" disabled title="Undo (Ctrl+Z)">
+                <span class="menu-icon">↶</span><span>Undo</span><span class="menu-shortcut">Ctrl+Z</span>
+              </button>
+              <button id="redo-btn" class="menu-item" type="button" disabled title="Redo (Ctrl+Y)">
+                <span class="menu-icon">↷</span><span>Redo</span><span class="menu-shortcut">Ctrl+Y</span>
+              </button>
+              <button id="goto-btn" class="menu-item" type="button" disabled title="Go To line or byte (Ctrl+G)">
+                <span class="menu-icon">⌖</span><span>Go To…</span><span class="menu-shortcut">Ctrl+G</span>
+              </button>
+              <div class="menu-separator"></div>
+              <button id="convert-crlf-btn" class="menu-item" type="button" disabled title="Convert line endings to CRLF (Windows)">
+                <span class="menu-icon">↵</span><span>Convert to CRLF</span><span class="menu-shortcut"></span>
+              </button>
+              <button id="convert-lf-btn" class="menu-item" type="button" disabled title="Convert line endings to LF (Unix/Linux)">
+                <span class="menu-icon">↓</span><span>Convert to LF</span><span class="menu-shortcut"></span>
+              </button>
+              <div class="menu-separator"></div>
+              <button id="prefs-btn" class="menu-item" type="button" title="Preferences">
+                <span class="menu-icon">⚙</span><span>Preferences…</span><span class="menu-shortcut"></span>
+              </button>
+            </div>
+          </div>
         </div>
-      </details>
-      <span id="file-name" title="Current document">No file open</span>
-      <label class="switch">
-        <input type="checkbox" id="read-only" />
-        <span class="switch-track"><span class="switch-knob"></span></span>
-        <span class="switch-text">Read-only</span>
-      </label>
-      <label class="switch">
-        <input type="checkbox" id="word-wrap" />
-        <span class="switch-track"><span class="switch-knob"></span></span>
-        <span class="switch-text">Wrap</span>
-      </label>
-    </div>
-    <div id="tab-bar">
-      <div id="tabs-container"></div>
-      <button id="new-tab-btn" title="New Tab (Ctrl+T)">+</button>
+      </div>
     </div>
     <div id="editor-wrap">
       <div id="editor-container"></div>
@@ -105,6 +105,16 @@
           <span class="switch-text">Regex</span>
         </label>
         <span id="position" aria-live="polite">Ln 1, Col 1</span>
+        <label class="switch">
+          <input type="checkbox" id="read-only" />
+          <span class="switch-track"><span class="switch-knob"></span></span>
+          <span class="switch-text">Read-only</span>
+        </label>
+        <label class="switch">
+          <input type="checkbox" id="word-wrap" />
+          <span class="switch-track"><span class="switch-knob"></span></span>
+          <span class="switch-text">Wrap</span>
+        </label>
         <span id="status"></span>
       </div>
       <div id="replace-row" class="find-row">
