@@ -56,6 +56,88 @@ body {
   border-top: 1px solid #000;
 }
 
+#tab-bar {
+  display: flex;
+  align-items: center;
+  background: #252525;
+  border-bottom: 1px solid #000;
+  height: 35px;
+  padding: 0 5px;
+  gap: 5px;
+}
+
+#tabs-container {
+  display: flex;
+  flex: 1;
+  overflow-x: auto;
+  gap: 2px;
+  height: 100%;
+  align-items: flex-end;
+}
+
+#tabs-container::-webkit-scrollbar {
+  height: 4px;
+}
+
+#tabs-container::-webkit-scrollbar-thumb {
+  background: #444;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  background: #2d2d2d;
+  color: #aaa;
+  padding: 5px 10px;
+  border-radius: 4px 4px 0 0;
+  font-size: 12px;
+  min-width: 100px;
+  max-width: 200px;
+  cursor: pointer;
+  user-select: none;
+  height: 28px;
+  position: relative;
+  gap: 8px;
+}
+
+.tab:hover {
+  background: #333;
+  color: #ccc;
+}
+
+.tab.active {
+  background: #1e1e1e;
+  color: #fff;
+}
+
+.tab .tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 2px;
+  font-size: 10px;
+}
+
+.tab .tab-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+#new-tab-btn {
+  background: transparent;
+  border: none;
+  color: #aaa;
+  cursor: pointer;
+  font-size: 18px;
+  padding: 0 10px;
+  height: 30px;
+}
+
+#new-tab-btn:hover {
+  color: #fff;
+}
+
 .find-row {
   display: flex;
   align-items: center;

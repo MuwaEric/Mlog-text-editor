@@ -805,19 +805,32 @@ fn empty_piece_table() -> PieceTable {
     PieceTable::new(Arc::new(mmap), Arc::new(Vec::new()))
 }
 
+use std::collections::HashMap;
+
+struct DocumentState {
+    table: PieceTable,
+    path: Option<PathBuf>,
+    last_modified_ms: u64,
+}
+
 struct AppState {
-    table: Arc<Mutex<Option<PieceTable>>>,
-    path: Arc<Mutex<Option<PathBuf>>>,
-    last_modified_ms: Arc<Mutex<u64>>,
+    documents: Arc<Mutex<HashMap<String, DocumentState>>>,
+    active_id: Arc<Mutex<String>>,
     active_search_id: Arc<AtomicU64>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let mut documents = HashMap::new();
+        let initial_id = "default".to_string();
+        documents.insert(initial_id.clone(), DocumentState {
+            table: empty_piece_table(),
+            path: None,
+            last_modified_ms: 0,
+        });
         Self {
-            table: Arc::new(Mutex::new(Some(empty_piece_table()))),
-            path: Arc::new(Mutex::new(None)),
-            last_modified_ms: Arc::new(Mutex::new(0)),
+            documents: Arc::new(Mutex::new(documents)),
+            active_id: Arc::new(Mutex::new(initial_id)),
             active_search_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -877,11 +890,12 @@ where
     T: Send + 'static,
     F: FnOnce(&mut PieceTable) -> T + Send + 'static,
 {
-    let inner = state.table.clone();
+    let documents = state.documents.clone();
+    let active_id = state.active_id.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = inner.lock().map_err(|e| e.to_string())?;
-        let table = guard.as_mut().ok_or("no file open")?;
-        Ok(f(table))
+        let mut guard = documents.lock().map_err(|e| e.to_string())?;
+        let doc = guard.get_mut(&active_id).ok_or("no active document")?;
+        Ok(f(&mut doc.table))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -946,14 +960,11 @@ async fn open_file(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<FileMeta, String> {
-    let inner = state.table.clone();
     let open_path = path.clone();
     let mtime = get_file_mtime_ms(&open_path);
 
     let (table, newline_format, encoding) = tauri::async_runtime::spawn_blocking(move || -> Result<(PieceTable, String, String), String> {
         let file = File::open(&path).map_err(|e| e.to_string())?;
-        // SAFETY: as with any mmap, behaviour is undefined if another process truncates the
-        // file while it is mapped. That is the standard, unavoidable caveat of this approach.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
 
         let sample_len = mmap.len().min(64 * 1024);
@@ -965,7 +976,7 @@ async fn open_file(
             let _ = app.emit(
                 "scan-progress",
                 ScanProgress {
-                    bytes_scanned: lines_scanned, // Progress reporting changed to lines for now, or keep bytes if we prefer
+                    bytes_scanned: lines_scanned,
                     total_bytes,
                 },
             );
@@ -981,9 +992,14 @@ async fn open_file(
         newline: newline_format,
         encoding,
     };
-    *inner.lock().map_err(|e| e.to_string())? = Some(table);
-    *state.path.lock().map_err(|e| e.to_string())? = Some(PathBuf::from(open_path));
-    *state.last_modified_ms.lock().map_err(|e| e.to_string())? = mtime;
+    
+    let active_id = state.active_id.lock().unwrap().clone();
+    let mut docs = state.documents.lock().map_err(|e| e.to_string())?;
+    let doc = docs.get_mut(&active_id).ok_or("no active document")?;
+    doc.table = table;
+    doc.path = Some(PathBuf::from(open_path));
+    doc.last_modified_ms = mtime;
+    
     Ok(meta)
 }
 
@@ -993,21 +1009,24 @@ async fn save_file(
     state: State<'_, AppState>,
     path: Option<String>,
 ) -> Result<FileMeta, String> {
+    let active_id = state.active_id.lock().unwrap().clone();
     let target = match path {
         Some(path) => PathBuf::from(path),
-        None => state
-            .path
-            .lock()
-            .map_err(|e| e.to_string())?
-            .clone()
-            .ok_or("no file path selected")?,
+        None => {
+            let docs = state.documents.lock().unwrap();
+            let doc = docs.get(&active_id).ok_or("no active document")?;
+            doc.path.clone().ok_or("no file path selected")?
+        }
     };
-    let inner = state.table.clone();
+    
+    let documents = state.documents.clone();
     let meta = tauri::async_runtime::spawn_blocking({
         let target = target.clone();
+        let active_id = active_id.clone();
         move || {
-            let guard = inner.lock().map_err(|e| e.to_string())?;
-            let table = guard.as_ref().ok_or("no file open")?;
+            let mut guard = documents.lock().map_err(|e| e.to_string())?;
+            let doc = guard.get_mut(&active_id).ok_or("no active document")?;
+            let table = &doc.table;
             let mut temporary = target.clone();
             temporary.set_extension(format!("gfe-tmp-{}", std::process::id()));
             let result = (|| -> Result<FileMeta, String> {
@@ -1015,8 +1034,6 @@ async fn save_file(
                 for piece in &table.pieces {
                     let bytes = table.piece_bytes(piece);
                     output.write_all(bytes).map_err(|e| e.to_string())?;
-                    
-                    // Tell the OS we don't need these pages anymore to keep RSS down.
                     if let Source::Original = piece.source {
                         release_memory(bytes);
                     }
@@ -1031,32 +1048,38 @@ async fn save_file(
                     encoding: detect_text_encoding(&sample).to_string(),
                 })
             })();
-            if result.is_err() { let _ = fs::remove_file(&temporary); }
+            if result.is_err() {
+                let _ = fs::remove_file(&temporary);
+            }
             result
         }
     })
     .await
     .map_err(|e| e.to_string())??;
-    let new_mtime = get_file_mtime_ms(&target.to_string_lossy());
-    *state.path.lock().map_err(|e| e.to_string())? = Some(target);
-    *state.last_modified_ms.lock().map_err(|e| e.to_string())? = new_mtime;
+
+    let mut guard = state.documents.lock().unwrap();
+    let doc = guard.get_mut(&active_id).unwrap();
+    doc.path = Some(target.clone());
+    doc.last_modified_ms = get_file_mtime_ms(&target.to_string_lossy());
     Ok(meta)
 }
 
 /// Checks if the currently opened file on disk has been modified externally.
 #[tauri::command]
 async fn check_file_changed(state: State<'_, AppState>) -> Result<bool, String> {
-    let path_opt = state.path.lock().map_err(|e| e.to_string())?.clone();
-    let path = match path_opt {
+    let active_id = state.active_id.lock().unwrap().clone();
+    let docs = state.documents.lock().unwrap();
+    let doc = docs.get(&active_id).ok_or("no active document")?;
+    
+    let path = match &doc.path {
         Some(p) => p,
         None => return Ok(false),
     };
-    let recorded_mtime = *state.last_modified_ms.lock().map_err(|e| e.to_string())?;
+    let recorded_mtime = doc.last_modified_ms;
     if recorded_mtime == 0 {
         return Ok(false);
     }
     let current_mtime = get_file_mtime_ms(&path.to_string_lossy());
-    // If mtime is newer by more than a tiny tolerance (10ms)
     Ok(current_mtime > recorded_mtime)
 }
 
@@ -1211,6 +1234,51 @@ async fn search_text(
 #[tauri::command]
 fn cancel_search(state: State<'_, AppState>) {
     state.active_search_id.store(0, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn switch_document(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let docs = state.documents.lock().map_err(|e| e.to_string())?;
+    if !docs.contains_key(&id) {
+        return Err("document not found".to_string());
+    }
+    *state.active_id.lock().unwrap() = id;
+    state.active_search_id.store(0, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn new_document(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut docs = state.documents.lock().map_err(|e| e.to_string())?;
+    docs.insert(id.clone(), DocumentState {
+        table: empty_piece_table(),
+        path: None,
+        last_modified_ms: 0,
+    });
+    *state.active_id.lock().unwrap() = id;
+    state.active_search_id.store(0, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn close_tab(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let mut docs = state.documents.lock().map_err(|e| e.to_string())?;
+    if docs.len() <= 1 {
+        // Can't close the last tab, just reset it
+        let doc = docs.values_mut().next().unwrap();
+        doc.table = empty_piece_table();
+        doc.path = None;
+        doc.last_modified_ms = 0;
+        return Ok(docs.keys().next().unwrap().clone());
+    }
+    
+    docs.remove(&id);
+    
+    let mut active_id = state.active_id.lock().unwrap();
+    if *active_id == id {
+        *active_id = docs.keys().next().unwrap().clone();
+    }
+    Ok(active_id.clone())
 }
 
 /// Replaces a single match range and returns the new document line count.
@@ -1370,6 +1438,9 @@ pub fn run() {
             check_file_changed,
             convert_line_endings,
             cancel_search,
+            switch_document,
+            new_document,
+            close_tab,
             startup_path
         ])
         .run(tauri::generate_context!())

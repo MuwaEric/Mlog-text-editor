@@ -215,6 +215,10 @@ let streamedNavigationRequestId: number | null = null;
 let positionRequestId = 0;
 let currentPath: string | null = null;
 let dirty = false;
+let currentTabId = "default";
+let tabs: { id: string; path: string | null; dirty: boolean }[] = [
+  { id: "default", path: null, dirty: false },
+];
 
 const RECOVERY_KEY = "gfe.recovery";
 const LINE_CACHE_KEY = "gfe.line-cache";
@@ -315,6 +319,7 @@ function setStatus(message: string) {
 }
 
 function updateDocumentState() {
+  const closeBtn = document.querySelector<HTMLButtonElement>("#close-btn");
   const save = document.querySelector<HTMLButtonElement>("#save-btn");
   const saveAs = document.querySelector<HTMLButtonElement>("#save-as-btn");
   const gotoBtn = document.querySelector<HTMLButtonElement>("#goto-btn");
@@ -330,13 +335,14 @@ function updateDocumentState() {
 
   const welcomeView = document.querySelector<HTMLElement>("#welcome-view");
   if (welcomeView) {
-    if (hasModel) {
+    if (hasFile) {
       welcomeView.classList.add("hidden");
     } else {
       welcomeView.classList.remove("hidden");
     }
   }
 
+  if (closeBtn) closeBtn.disabled = !hasFile;
   if (save) save.disabled = !hasModel || !dirty || isReadOnly;
   if (saveAs) saveAs.disabled = !hasModel || isReadOnly;
   if (gotoBtn) gotoBtn.disabled = !hasFile;
@@ -374,8 +380,14 @@ async function saveDocument(path: string | null = currentPath) {
   const meta = await invoke<FileMeta>("save_file", { path });
   currentPath = path;
   dirty = false;
+  const tab = tabs.find(t => t.id === currentTabId);
+  if (tab) {
+    tab.path = path;
+    tab.dirty = false;
+  }
   clearRecoveryState();
   updateDocumentState();
+  updateTabsUI();
   setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} saved`);
 }
 
@@ -774,7 +786,16 @@ async function openFile(path: string) {
   if (nameEl) nameEl.textContent = path.split("/").pop() ?? path;
   currentPath = path;
   dirty = false;
+  const tab = tabs.find(t => t.id === currentTabId);
+  if (tab) {
+    tab.path = path;
+    tab.dirty = false;
+  }
   updateDocumentState();
+  updateTabsUI();
+
+  const welcome = document.querySelector<HTMLElement>("#welcome-view");
+  if (welcome) welcome.hidden = true;
 
   hits = [];
   hitIndex = -1;
@@ -796,6 +817,104 @@ async function openFile(path: string) {
       ? `${baseStatus} (⚠️ previous session had unsaved changes)`
       : baseStatus
   );
+}
+
+async function closeFile() {
+  await closeTab(currentTabId);
+}
+
+function updateTabsUI() {
+  const container = document.querySelector("#tabs-container");
+  if (!container) return;
+  container.innerHTML = "";
+  tabs.forEach((tab) => {
+    const el = document.createElement("div");
+    el.className = `tab${tab.id === currentTabId ? " active" : ""}`;
+    const name = tab.path ? tab.path.split("/").pop() ?? tab.path : "Untitled";
+    el.innerHTML = `
+      <span class="tab-name">${name}${tab.dirty ? " *" : ""}</span>
+      <span class="tab-close" title="Close Tab">✕</span>
+    `;
+    el.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).classList.contains("tab-close")) {
+        void closeTab(tab.id);
+      } else {
+        void switchTab(tab.id);
+      }
+    });
+    container.appendChild(el);
+  });
+}
+
+async function switchTab(id: string) {
+  if (id === currentTabId) return;
+  await invoke("switch_document", { id });
+  currentTabId = id;
+  const tab = tabs.find((t) => t.id === id)!;
+  currentPath = tab.path;
+  dirty = tab.dirty;
+
+  if (currentPath) {
+    // Re-open/refresh the editor for this file
+    // We need to fetch the file meta to restore state
+    const meta = await invoke<FileMeta>("open_file", { path: currentPath });
+    totalLines = meta.total_lines;
+    const cachedPos = readLineCache()[currentPath];
+    viewTop = cachedPos?.line ?? 1;
+    await anchorWindow(viewTop);
+  } else {
+    totalLines = 0;
+    if (editor) editor.setValue("");
+  }
+  
+  updateDocumentState();
+  updateTabsUI();
+  updateScrollbar();
+  updateHitControls();
+  updateSearchDecorations();
+}
+
+async function newTab() {
+  const id = Math.random().toString(36).substring(7);
+  await invoke("new_document", { id });
+  tabs.push({ id, path: null, dirty: false });
+  void switchTab(id);
+}
+
+async function closeTab(id: string) {
+  const tab = tabs.find((t) => t.id === id);
+  if (tab?.dirty && !confirm(`Unsaved changes in ${tab.path ?? "Untitled"}. Close anyway?`)) {
+    return;
+  }
+  
+  const nextActiveId = await invoke<string>("close_tab", { id });
+  if (tabs.length > 1) {
+    tabs = tabs.filter((t) => t.id !== id);
+  } else {
+    // Last tab was reset
+    tabs[0].path = null;
+    tabs[0].dirty = false;
+  }
+  
+  if (currentTabId === id) {
+    currentTabId = nextActiveId;
+    const nextTab = tabs.find((t) => t.id === nextActiveId)!;
+    currentPath = nextTab.path;
+    dirty = nextTab.dirty;
+    if (currentPath) {
+        void switchTab(nextActiveId);
+    } else {
+        totalLines = 0;
+        if (editor) editor.setValue("");
+        updateDocumentState();
+        updateTabsUI();
+        updateScrollbar();
+        updateHitControls();
+        updateSearchDecorations();
+    }
+  } else {
+    updateTabsUI();
+  }
 }
 
 /**
@@ -837,7 +956,10 @@ function wireEditEvents() {
     if (model) windowCount = model.getLineCount();
     updateScrollbar();
     dirty = true;
+    const tab = tabs.find(t => t.id === currentTabId);
+    if (tab) tab.dirty = true;
     updateDocumentState();
+    updateTabsUI();
     updateHistoryControls();
     persistRecoveryState();
   });
@@ -1226,7 +1348,9 @@ function initApp() {
   };
 
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
+  document.querySelector("#close-btn")?.addEventListener("click", closeFile);
   document.querySelector("#welcome-open-btn")?.addEventListener("click", chooseFile);
+  document.querySelector("#new-tab-btn")?.addEventListener("click", () => void newTab());
   document.querySelector("#prefs-btn")?.addEventListener("click", openPreferences);
   wirePreferences();
   wireGotoDialog();
@@ -1241,6 +1365,14 @@ function initApp() {
     if (event.key === "Escape" && actionsMenu?.open) {
       actionsMenu.open = false;
     }
+    if ((event.ctrlKey || event.metaKey) && event.key === "t") {
+      event.preventDefault();
+      void newTab();
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key === "w" && currentPath) {
+      event.preventDefault();
+      void closeTab(currentTabId);
+    }
   });
 
   loadPrefs();
@@ -1254,6 +1386,7 @@ function initApp() {
 
   wireScrollbar();
   updateDocumentState();
+  updateTabsUI();
   updateHistoryControls();
 
   document.querySelector("#save-btn")?.addEventListener("click", () => {
@@ -1345,6 +1478,12 @@ function initApp() {
 
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, focusSearch);
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusReplace);
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyT, () => {
+      void newTab();
+    });
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW, () => {
+      void closeTab(currentTabId);
+    });
     ed.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
     ed.addCommand(
       monaco.KeyMod.Shift | monaco.KeyCode.F3,
