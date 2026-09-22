@@ -32,28 +32,163 @@ body {
   flex-direction: column;
 }
 
-#toolbar,
+#header-bar,
 #findbar {
   padding: 0.45em 0.6em;
-  background: #1e1e1e;
+  background: #242424;
   color: #eee;
   flex: none;
 }
 
-#toolbar {
+#header-bar {
   display: flex;
   align-items: center;
-  gap: 0.6em;
+  justify-content: space-between;
+  height: 46px;
   position: relative;
   z-index: 100;
-  border-bottom: 1px solid #000;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.4);
+  background: #242424;
+  padding: 0 6px;
 }
 
-#findbar {
+#header-left, #header-right {
   display: flex;
-  flex-direction: column;
-  gap: 0.4em;
-  border-top: 1px solid #000;
+  align-items: center;
+  min-width: 46px;
+}
+
+#header-center {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  height: 100%;
+  overflow: hidden;
+  max-width: 60%;
+}
+
+.header-btn {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #eee;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.header-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.header-btn:active {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.header-btn .icon {
+  font-size: 1.2em;
+}
+
+#tabs-container {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  height: 100%;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  background: transparent;
+  color: #aaa;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  min-width: 100px;
+  max-width: 180px;
+  cursor: pointer;
+  user-select: none;
+  height: 34px;
+  position: relative;
+  gap: 8px;
+  transition: background 0.2s, color 0.2s;
+}
+
+.tab:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #ccc;
+}
+
+.tab.active {
+  background: #353535;
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.tab .tab-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab .tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.tab .tab-close:hover {
+  background: rgba(255, 255, 255, 0.15);
+  opacity: 1;
+}
+
+#popover-anchor {
+  position: relative;
+}
+
+.popover {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: -6px;
+  z-index: 10000;
+  min-width: 19em;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: #2d2d2d;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  transition: opacity 0.2s, transform 0.2s;
+  transform-origin: top right;
+}
+
+.popover.hidden {
+  display: none;
+  opacity: 0;
+  transform: scale(0.95);
+}
+
+.popover-arrow {
+  position: absolute;
+  top: -6px;
+  right: 14px;
+  width: 12px;
+  height: 12px;
+  background: #2d2d2d;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  transform: rotate(45deg);
 }
 
 .find-row {
@@ -67,11 +202,21 @@ body {
 #findbar input[type="text"],
 #search-input,
 #replace-input {
-  padding: 0.3em 0.5em;
-  border: 1px solid #ffffff26;
-  border-radius: 4px;
-  background: #2b2b2b;
+  padding: 0.35em 0.7em;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: #353535;
   color: #eee;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+#toolbar input:focus,
+#findbar input[type="text"]:focus,
+#search-input:focus,
+#replace-input:focus {
+  border-color: #3584e4;
+  background: #3d3d3d;
+  outline: none;
 }
 
 #search-input,
@@ -88,19 +233,33 @@ body {
 #toolbar button,
 #findbar button,
 .menu-btn {
-  padding: 0.3em 0.7em;
-  border: 1px solid #ffffff26;
-  border-radius: 4px;
-  background: #333;
+  padding: 0.4em 0.8em;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: #353535;
   color: #eee;
   cursor: pointer;
   user-select: none;
   -webkit-user-select: none;
+  transition: background 0.2s, border-color 0.2s;
 }
 
 #toolbar button:hover,
 #findbar button:hover {
   background: #3d3d3d;
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+#toolbar button:active,
+#findbar button:active {
+  background: #454545;
+}
+
+#toolbar button:disabled,
+#findbar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: #2d2d2d;
 }
 
 #actions-menu {
@@ -139,40 +298,31 @@ body {
 }
 
 .actions-list {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  z-index: 10000;
   display: flex;
-  min-width: 19em;
   flex-direction: column;
   gap: 2px;
-  padding: 0.4em;
-  border: 1px solid #ffffff26;
-  border-radius: 8px;
-  background: #252525;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
 }
 
 .actions-list .menu-item {
   display: grid;
   grid-template-columns: 1.5em 1fr auto;
   align-items: center;
-  gap: 0.6em;
+  gap: 0.8em;
   width: 100%;
-  padding: 0.4em 0.6em;
+  padding: 0.6em 0.8em;
   border: none;
-  border-radius: 4px;
+  border-radius: 6px;
   background: transparent;
   color: #eee;
-  font-size: 0.9em;
+  font-size: 0.95em;
   text-align: left;
   cursor: pointer;
   box-shadow: none;
+  transition: background 0.2s;
 }
 
 .actions-list .menu-item:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .actions-list .menu-item:disabled {
@@ -383,6 +533,50 @@ body {
   font-size: 0.9em;
 }
 
+.metadata-section {
+  margin-top: 1.25em;
+  padding-top: 0.75em;
+  border-top: 1px solid #ddd;
+}
+
+.metadata-display {
+  font-size: 0.9em;
+  opacity: 0.8;
+  max-width: 25em;
+  text-align: right;
+  word-break: break-all;
+}
+
+.shortcut-input {
+  width: 10em !important;
+  text-align: center;
+  cursor: pointer;
+  caret-color: transparent;
+  background: #353535;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  color: #eee;
+  padding: 0.2em 0.5em;
+}
+
+.shortcut-input:focus {
+  border-color: #007acc;
+  outline: none;
+  background: #404040;
+}
+
+.pref-row h3 {
+  margin: 0;
+  font-size: 1.1em;
+  color: #fff;
+}
+
+.metadata-section h3 {
+  margin: 0 0 0.5em 0;
+  font-size: 1.1em;
+  color: #fff;
+}
+
 .pref-row input[type="number"],
 .pref-row select {
   width: 8em;
@@ -415,6 +609,53 @@ body {
   inset: 0 14px 0 0;
 }
 
+#welcome-view {
+  position: absolute;
+  inset: 0 14px 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1e1e1e;
+  color: #eee;
+  z-index: 10;
+}
+
+#welcome-view.hidden {
+  display: none;
+}
+
+.welcome-content {
+  text-align: center;
+  max-width: 400px;
+}
+
+.welcome-content h1 {
+  font-size: 2.5em;
+  margin-bottom: 0.2em;
+  color: #3f7ddb;
+}
+
+.welcome-content p {
+  font-size: 1.1em;
+  opacity: 0.7;
+  margin-bottom: 2em;
+}
+
+.welcome-actions button {
+  padding: 0.8em 2em;
+  font-size: 1.1em;
+  background: #3f7ddb;
+  border: none;
+  border-radius: 4px;
+  color: white;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.welcome-actions button:hover {
+  background: #2b5fb3;
+}
+
 /* Search matches remain visible after the active selection moves. */
 .monaco-editor .gfe-search-match {
   background: #f59e0b66;
@@ -437,6 +678,17 @@ body {
   bottom: 0;
   width: 14px;
   background: #00000014;
+}
+
+.search-marker {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background: #f59e0b;
+  opacity: 0.7;
+  pointer-events: none;
+  z-index: 1;
 }
 
 #vthumb {

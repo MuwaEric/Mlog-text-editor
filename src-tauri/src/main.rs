@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    giant_file_editor_lib::run()
+    mlog_text_editor_lib::run()
 }

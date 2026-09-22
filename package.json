@@ -1,8 +1,16 @@
 {
-  "name": "giant-file-editor",
-  "private": true,
+  "name": "mlog-text-editor",
+  "private": false,
   "version": "0.1.0",
   "type": "module",
+  "homepage": "https://github.com/MuwaEric/Mlog-text-editor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MuwaEric/Mlog-text-editor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MuwaEric/Mlog-text-editor/issues"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

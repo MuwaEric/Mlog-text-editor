@@ -11,8 +11,8 @@ use serde::Serialize;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tauri::{Emitter, State};
 
 /// Bytes read per parallel search/scan chunk (64 MiB) — large enough to amortize thread
@@ -45,9 +45,12 @@ struct Piece {
 /// Line lookups are served by a two-level index: each buffer keeps a sorted vector of its own
 /// `\n` byte positions, and `cum_bytes`/`cum_lines` hold prefix sums across the piece list. A
 /// (line, column) query is therefore two binary searches, never a scan of the document.
+///
+/// For the `original` buffer, we use a sparse index (storing every 100th newline) to save RAM
+/// on multi-gigabyte files. Missing newlines are scanned on demand.
 struct PieceTable {
     original: Arc<Mmap>,
-    /// Byte position of every `\n` in the original mmap; built once, off the UI thread.
+    /// Sparse byte position of `\n` in the original mmap. Contains every 100th newline.
     original_nl: Arc<Vec<usize>>,
     added: String,
     /// Byte position of every `\n` in the changes buffer; appended to on each insert, so it
@@ -58,6 +61,8 @@ struct PieceTable {
     cum_bytes: Vec<usize>,
     cum_lines: Vec<usize>,
 }
+
+const SPARSE_FACTOR: usize = 100;
 
 impl PieceTable {
     fn new(original: Arc<Mmap>, original_nl: Arc<Vec<usize>>) -> Self {
@@ -91,19 +96,108 @@ impl PieceTable {
         }
     }
 
-    /// The newline positions (absolute within their own buffer) that fall inside `p`.
-    fn piece_newlines(&self, p: &Piece) -> &[usize] {
-        let nl: &[usize] = match p.source {
-            Source::Original => &self.original_nl,
-            Source::Added => &self.added_nl,
-        };
-        let lo = nl.partition_point(|&x| x < p.offset);
-        let hi = nl.partition_point(|&x| x < p.offset + p.length);
-        &nl[lo..hi]
+    /// The number of newlines that fall inside `p`.
+    fn piece_newline_count(&self, p: &Piece) -> usize {
+        match p.source {
+            Source::Original => {
+                // We don't have all newlines, but we know the total count and can find
+                // the range in the sparse index.
+                // However, we need the exact count within the piece's range.
+                // We can use the same logic as partition_point if we had all newlines.
+                // For sparse, we need to count them.
+                self.count_newlines_in_range(p.source, p.offset, p.offset + p.length)
+            }
+            Source::Added => {
+                let lo = self.added_nl.partition_point(|&x| x < p.offset);
+                let hi = self.added_nl.partition_point(|&x| x < p.offset + p.length);
+                hi - lo
+            }
+        }
     }
 
-    /// Recomputes the prefix sums. O(pieces), and every piece's newline count is itself two
-    /// binary searches, so this stays cheap as long as the piece list does.
+    fn count_newlines_in_range(&self, source: Source, start: usize, end: usize) -> usize {
+        match source {
+            Source::Original => {
+                // Find sparse indices that bound this range
+                let lo_idx = self.original_nl.partition_point(|&x| x < start);
+                let hi_idx = self.original_nl.partition_point(|&x| x < end);
+
+                if lo_idx == hi_idx {
+                    // All newlines are between two sparse points (or before first/after last)
+                    let scan_start = if lo_idx == 0 { 0 } else { self.original_nl[lo_idx - 1] + 1 };
+                    let scan_end = end;
+                    let data = &self.original[scan_start.max(start)..scan_end];
+                    memchr::memchr_iter(b'\n', data).count()
+                } else {
+                    // Count: (newlines before first sparse point) + (sparse points) + (newlines after last sparse point)
+                    let first_sparse = self.original_nl[lo_idx];
+                    let last_sparse = self.original_nl[hi_idx - 1];
+
+                    let head_count = memchr::memchr_iter(b'\n', &self.original[start..first_sparse]).count();
+                    let tail_count = memchr::memchr_iter(b'\n', &self.original[last_sparse + 1..end]).count();
+                    let total_between = (hi_idx - lo_idx - 1) * SPARSE_FACTOR;
+                    head_count + total_between + 1 + tail_count // +1 for the first_sparse itself
+                }
+            }
+            Source::Added => {
+                let lo = self.added_nl.partition_point(|&x| x < start);
+                let hi = self.added_nl.partition_point(|&x| x < end);
+                hi - lo
+            }
+        }
+    }
+
+    /// Logical byte offset at which `local_line` (0-indexed within the piece) begins.
+    fn offset_of_line_in_piece(&self, p: &Piece, local_line: usize) -> usize {
+        if local_line == 0 {
+            return p.offset;
+        }
+        let target_nl_idx = local_line - 1;
+        match p.source {
+            Source::Original => {
+                // 1. Find how many newlines are before the piece starts in the original buffer
+                let nls_before_piece = self.count_newlines_in_range(Source::Original, 0, p.offset);
+                let absolute_nl_idx = nls_before_piece + target_nl_idx;
+
+                // 2. Use sparse index to find a starting point
+                let sparse_idx = absolute_nl_idx / SPARSE_FACTOR;
+                let (mut scan_start, mut remaining) = if sparse_idx > 0 && sparse_idx <= self.original_nl.len() {
+                    let prev_sparse_idx = sparse_idx - 1;
+                    (self.original_nl[prev_sparse_idx] + 1, absolute_nl_idx - (prev_sparse_idx + 1) * SPARSE_FACTOR)
+                } else {
+                    (0, absolute_nl_idx)
+                };
+
+                if scan_start < p.offset {
+                    // If sparse point is before piece, start scanning from piece start
+                    let nls_between = self.count_newlines_in_range(Source::Original, scan_start, p.offset);
+                    scan_start = p.offset;
+                    remaining = remaining.saturating_sub(nls_between);
+                }
+
+                if remaining == 0 {
+                    // Check if the newline at scan_start-1 is the one we want.
+                    // But we want the offset of the line AFTER the newline.
+                    // If remaining is 0, we are looking for the newline at absolute_nl_idx.
+                }
+
+                let mut it = memchr::memchr_iter(b'\n', &self.original[scan_start..p.offset + p.length]);
+                let rel_offset = it.nth(remaining).expect("line index out of bounds in piece");
+                scan_start + rel_offset + 1
+            }
+            Source::Added => {
+                let lo = self.added_nl.partition_point(|&x| x < p.offset);
+                self.added_nl[lo + target_nl_idx] + 1
+            }
+        }
+    }
+
+    /// Number of newlines in piece `p` before relative offset `within`.
+    fn newline_count_before_offset_in_piece(&self, p: &Piece, within: usize) -> usize {
+        self.count_newlines_in_range(p.source, p.offset, p.offset + within)
+    }
+
+    /// Recomputes the prefix sums. O(pieces)
     fn rebuild_index(&mut self) {
         let n = self.pieces.len();
         let mut cum_bytes = Vec::with_capacity(n + 1);
@@ -114,7 +208,7 @@ impl PieceTable {
         for i in 0..n {
             let p = self.pieces[i];
             bytes += p.length;
-            lines += self.piece_newlines(&p).len();
+            lines += self.piece_newline_count(&p);
             cum_bytes.push(bytes);
             cum_lines.push(lines);
         }
@@ -243,7 +337,7 @@ impl PieceTable {
         String::from_utf8_lossy(&self.get_bytes_range(start, end)).into_owned()
     }
 
-    /// Logical byte offset at which 0-indexed `line` begins. Two binary searches, no scanning.
+    /// Logical byte offset at which 0-indexed `line` begins.
     fn offset_of_line(&self, line: usize) -> usize {
         if line == 0 {
             return 0;
@@ -254,9 +348,9 @@ impl PieceTable {
         }
         let i = self.cum_lines.partition_point(|&c| c <= target) - 1;
         let p = self.pieces[i];
-        let local = target - self.cum_lines[i];
-        let nl_pos = self.piece_newlines(&p)[local];
-        self.cum_bytes[i] + (nl_pos - p.offset) + 1
+        let local_nl_idx = target - self.cum_lines[i];
+        let line_offset = self.offset_of_line_in_piece(&p, local_nl_idx + 1);
+        self.cum_bytes[i] + (line_offset - p.offset)
     }
 
     /// 0-indexed line containing logical byte `offset`.
@@ -268,9 +362,7 @@ impl PieceTable {
         let i = self.piece_at_offset(offset);
         let p = self.pieces[i];
         let within = offset - self.cum_bytes[i];
-        let count = self
-            .piece_newlines(&p)
-            .partition_point(|&x| x < p.offset + within);
+        let count = self.newline_count_before_offset_in_piece(&p, within);
         self.cum_lines[i] + count
     }
 
@@ -329,32 +421,82 @@ fn utf16_len(s: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Memory management
+// ---------------------------------------------------------------------------------------------
+
+/// Advise the OS that we don't need the physical pages backing `data` right now. This keeps
+/// Resident Set Size (RSS) low after a full-file scan.
+#[allow(unused_variables)]
+fn release_memory(data: &[u8]) {
+    #[cfg(unix)]
+    {
+        let ptr = data.as_ptr() as *mut libc::c_void;
+        let len = data.len() as libc::size_t;
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_DONTNEED);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Memory::{VirtualUnlock};
+        let ptr = data.as_ptr() as *const std::ffi::c_void;
+        let len = data.len();
+        unsafe {
+            // VirtualUnlock on a range that wasn't locked is a no-op that returns an error,
+            // but it has the side effect of reducing the working set (like MADV_DONTNEED).
+            let _ = VirtualUnlock(ptr, len);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Initial newline scan over the mmap
 // ---------------------------------------------------------------------------------------------
 
-/// Records the byte position of every `\n` in `data` with a fast SIMD byte loop (`memchr`),
-/// parallelized across `CHUNK_SIZE` chunks. This is the single full pass over the file, and it
-/// runs off the UI thread. Note the inherent cost: one `usize` per line, so a file with 200 M
-/// lines needs ~1.6 GB for the index alone.
-fn scan_newlines(data: &[u8], mut on_chunk: impl FnMut(usize) + Send) -> Vec<usize> {
+/// Records the byte position of every 100th `\n` in `data` with a fast SIMD byte loop (`memchr`),
+/// parallelized across `CHUNK_SIZE` chunks. This significantly reduces RAM overhead for the index.
+fn scan_newlines(data: &[u8], mut on_chunk: impl FnMut(usize) + Send) -> (Vec<usize>, usize) {
     let starts: Vec<usize> = (0..data.len()).step_by(CHUNK_SIZE).collect();
-    let per_chunk: Vec<Vec<usize>> = starts
+    let counts: Vec<usize> = starts
         .par_iter()
         .map(|&s| {
             let e = (s + CHUNK_SIZE).min(data.len());
-            memchr::memchr_iter(b'\n', &data[s..e])
-                .map(|rel| s + rel)
-                .collect()
+            memchr::memchr_iter(b'\n', &data[s..e]).count()
         })
         .collect();
 
-    let total: usize = per_chunk.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(total);
-    for mut chunk in per_chunk {
-        out.append(&mut chunk); // frees each chunk as it is merged, keeping peak memory down
-        on_chunk(out.len());
+    let total_count: usize = counts.iter().sum();
+    let mut sparse_nls = Vec::with_capacity(total_count / SPARSE_FACTOR);
+
+    let mut global_count = 0;
+    for (i, &s) in starts.iter().enumerate() {
+        let e = (s + CHUNK_SIZE).min(data.len());
+        let chunk_data = &data[s..e];
+
+        // For each chunk, we only scan if it might contain the next global sparse point.
+        // next_sparse_at is 100, 200, 300...
+        // If current global_count is 50 and chunk has 60, it contains global 100.
+        let chunk_count = counts[i];
+        let next_sparse_idx = ((global_count / SPARSE_FACTOR) + 1) * SPARSE_FACTOR;
+        
+        if next_sparse_idx <= global_count + chunk_count {
+            // This chunk contains at least one sparse point.
+            let mut local_count = 0;
+            for rel in memchr::memchr_iter(b'\n', chunk_data) {
+                local_count += 1;
+                if (global_count + local_count) % SPARSE_FACTOR == 0 {
+                    sparse_nls.push(s + rel);
+                }
+            }
+        }
+        global_count += chunk_count;
+        on_chunk(global_count);
+
+        // Tell the OS we don't need these pages anymore to keep RSS down.
+        release_memory(chunk_data);
     }
-    out
+    (sparse_nls, total_count)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -436,7 +578,9 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
 #[allow(dead_code)]
 fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
-    search_document_with_progress(table, pattern, fold_case, false, None, 0)
+    search_document_with_progress(table, pattern, fold_case, false, None, None, 0)
+        .map(|(hits, _)| hits)
+        .unwrap_or_default()
 }
 
 fn is_word_byte(byte: u8) -> bool {
@@ -464,22 +608,55 @@ fn search_regex_document(
     table: &PieceTable,
     regex: &regex::bytes::Regex,
     whole_word: bool,
-) -> Vec<(usize, usize)> {
+    active_search_id: Option<&AtomicU64>,
+    request_id: u64,
+) -> Result<(Vec<(usize, usize)>, usize), String> {
     let mut matches = Vec::new();
+    let mut total_matches = 0;
     for (piece_index, piece) in table.pieces.iter().enumerate() {
         let base = table.cum_bytes[piece_index];
-        let bytes = table.piece_bytes(piece);
-        for found in regex.find_iter(bytes) {
-            let offset = base + found.start();
-            let length = found.end().saturating_sub(found.start());
-            if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
-                matches.push((offset, length));
+        if let Source::Original = piece.source {
+            // For the original mmap, we scan in chunks to keep RAM usage low.
+            for s in (0..piece.length).step_by(CHUNK_SIZE) {
+                if let Some(active) = active_search_id {
+                    if active.load(Ordering::Relaxed) != request_id {
+                        return Err("search cancelled".to_string());
+                    }
+                }
+                let e = (s + CHUNK_SIZE).min(piece.length);
+                let chunk_bytes = &table.original[piece.offset + s..piece.offset + e];
+                for found in regex.find_iter(chunk_bytes) {
+                    let offset = base + s + found.start();
+                    let length = found.end().saturating_sub(found.start());
+                    if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
+                        total_matches += 1;
+                        if matches.len() < MAX_REPORTED_HITS {
+                            matches.push((offset, length));
+                        }
+                    }
+                }
+                
+                // Tell the OS we don't need these pages anymore.
+                release_memory(chunk_bytes);
+            }
+        } else {
+            // Added pieces are in RAM anyway.
+            let bytes = table.piece_bytes(piece);
+            for found in regex.find_iter(bytes) {
+                let offset = base + found.start();
+                let length = found.end().saturating_sub(found.start());
+                if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
+                    total_matches += 1;
+                    if matches.len() < MAX_REPORTED_HITS {
+                        matches.push((offset, length));
+                    }
+                }
             }
         }
     }
     matches.sort_unstable_by_key(|&(offset, _)| offset);
     matches.dedup_by_key(|(offset, _)| *offset);
-    matches
+    Ok((matches, total_matches))
 }
 
 fn search_document_with_progress(
@@ -488,11 +665,12 @@ fn search_document_with_progress(
     fold_case: bool,
     whole_word: bool,
     app: Option<&tauri::AppHandle>,
+    active_search_id: Option<&AtomicU64>,
     request_id: u64,
-) -> Vec<usize> {
+) -> Result<(Vec<usize>, usize), String> {
     let m = pattern.len();
     if m == 0 {
-        return Vec::new();
+        return Ok((Vec::new(), 0));
     }
     let overlap = m - 1;
 
@@ -505,11 +683,21 @@ fn search_document_with_progress(
 
     let bytes_scanned = Arc::new(AtomicUsize::new(0));
     let matches_found = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let total_bytes = table.total_length();
 
-    let mut hits: Vec<usize> = tasks
+    let hits: Vec<usize> = tasks
         .par_iter()
         .flat_map(|&(i, s)| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if let Some(active) = active_search_id {
+                if active.load(Ordering::Relaxed) != request_id {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Vec::new();
+                }
+            }
             let p = table.pieces[i];
             let bytes = table.piece_bytes(&p);
             let primary_end = (s + CHUNK_SIZE).min(p.length);
@@ -523,8 +711,11 @@ fn search_document_with_progress(
                     !whole_word || is_whole_word_match(table, offset, pattern.len())
                 })
                 .collect::<Vec<_>>();
-            let streamed_hits = local_hits
-                .iter()
+            
+            let current_matches = matches_found.fetch_add(local_hits.len(), Ordering::Relaxed);
+            let streamed_hits = if current_matches < MAX_REPORTED_HITS {
+                let limit = (MAX_REPORTED_HITS - current_matches).min(local_hits.len());
+                local_hits[..limit].iter()
                 .map(|&byte_offset| {
                     let (line, column) = table.position_of_offset(byte_offset);
                     let (end_line, end_column) =
@@ -537,9 +728,12 @@ fn search_document_with_progress(
                         end_column,
                     }
                 })
-                .collect();
+                .collect()
+            } else {
+                Vec::new()
+            };
             bytes_scanned.fetch_add(primary_end - s, Ordering::Relaxed);
-            matches_found.fetch_add(local_hits.len(), Ordering::Relaxed);
+            
             if let Some(app) = app {
                 let _ = app.emit(
                     "search-progress",
@@ -552,29 +746,64 @@ fn search_document_with_progress(
                     },
                 );
             }
-            local_hits
+            
+            // Tell the OS we don't need these pages anymore to keep RSS down.
+            if let Source::Original = p.source {
+                release_memory(&bytes[s..scan_end]);
+            }
+            
+            if current_matches < MAX_REPORTED_HITS {
+                let limit = (MAX_REPORTED_HITS - current_matches).min(local_hits.len());
+                local_hits[..limit].to_vec()
+            } else {
+                Vec::new()
+            }
         })
         .collect();
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("search cancelled".to_string());
+    }
 
     let total = table.total_length();
     let boundary_hits: Vec<usize> = (1..table.pieces.len())
         .into_par_iter()
         .flat_map(|i| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if let Some(active) = active_search_id {
+                if active.load(Ordering::Relaxed) != request_id {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Vec::new();
+                }
+            }
             let b = table.cum_bytes[i];
             let lo = b.saturating_sub(overlap);
             let hi = (b + overlap).min(total);
             let window = table.get_bytes_range(lo, hi);
             boyer_moore_horspool(&window, pattern, fold_case)
                 .into_iter()
+                .filter(move |&local| {
+                    let abs = lo + local;
+                    abs < b && abs + m > b
+                })
                 .map(move |local| lo + local)
-                .filter(move |&abs| abs < b && abs + m > b)
                 .collect::<Vec<_>>()
         })
         .collect();
 
-    hits.extend(boundary_hits);
-    hits.sort_unstable();
-    hits.dedup(); // a match spanning several tiny pieces is found at each boundary it crosses
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("search cancelled".to_string());
+    }
+
+    let mut all_hits = hits;
+    all_hits.extend(boundary_hits.iter().cloned());
+    all_hits.sort_unstable();
+    all_hits.dedup(); 
+    
+    let final_total = matches_found.load(Ordering::Relaxed) + boundary_hits.len(); // Approximate if many boundary hits, but good enough
+
     if let Some(app) = app {
         let _ = app.emit(
             "search-progress",
@@ -582,12 +811,12 @@ fn search_document_with_progress(
                 request_id,
                 bytes_scanned: total_bytes,
                 total_bytes,
-                matches_found: hits.len(),
+                matches_found: final_total,
                 hits: Vec::new(),
             },
         );
     }
-    hits
+    Ok((all_hits, final_total))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -596,7 +825,7 @@ fn search_document_with_progress(
 
 /// Matches returned to the UI are capped: a search for "e" in an 8 GB file has billions of
 /// hits, and serializing them over IPC would defeat the whole point of streaming the file.
-const MAX_REPORTED_HITS: usize = 5_000;
+const MAX_REPORTED_HITS: usize = 200_000;
 
 fn empty_piece_table() -> PieceTable {
     let mmap = MmapOptions::new().len(0).map_anon().unwrap();
@@ -604,18 +833,33 @@ fn empty_piece_table() -> PieceTable {
     PieceTable::new(Arc::new(mmap), Arc::new(Vec::new()))
 }
 
+use std::collections::HashMap;
+
+struct DocumentState {
+    table: PieceTable,
+    path: Option<PathBuf>,
+    last_modified_ms: u64,
+}
+
 struct AppState {
-    table: Arc<Mutex<Option<PieceTable>>>,
-    path: Arc<Mutex<Option<PathBuf>>>,
-    last_modified_ms: Arc<Mutex<u64>>,
+    documents: Arc<RwLock<HashMap<String, DocumentState>>>,
+    active_id: Arc<Mutex<String>>,
+    active_search_id: Arc<AtomicU64>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let mut documents = HashMap::new();
+        let initial_id = "default".to_string();
+        documents.insert(initial_id.clone(), DocumentState {
+            table: empty_piece_table(),
+            path: None,
+            last_modified_ms: 0,
+        });
         Self {
-            table: Arc::new(Mutex::new(Some(empty_piece_table()))),
-            path: Arc::new(Mutex::new(None)),
-            last_modified_ms: Arc::new(Mutex::new(0)),
+            documents: Arc::new(RwLock::new(documents)),
+            active_id: Arc::new(Mutex::new(initial_id)),
+            active_search_id: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -669,16 +913,33 @@ struct SearchProgress {
 
 /// Runs `f` against the open document on a blocking thread so neither the mmap page faults nor
 /// the index work ever land on the UI thread.
-async fn with_table<T, F>(state: &State<'_, AppState>, f: F) -> Result<T, String>
+async fn with_table_read<T, F>(state: &State<'_, AppState>, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&PieceTable) -> T + Send + 'static,
+{
+    let documents = state.documents.clone();
+    let active_id = state.active_id.lock().unwrap().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = documents.read().map_err(|e| e.to_string())?;
+        let doc = guard.get(&active_id).ok_or("no active document")?;
+        Ok(f(&doc.table))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn with_table_write<T, F>(state: &State<'_, AppState>, f: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&mut PieceTable) -> T + Send + 'static,
 {
-    let inner = state.table.clone();
+    let documents = state.documents.clone();
+    let active_id = state.active_id.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = inner.lock().map_err(|e| e.to_string())?;
-        let table = guard.as_mut().ok_or("no file open")?;
-        Ok(f(table))
+            let mut guard = documents.write().map_err(|e| e.to_string())?;
+        let doc = guard.get_mut(&active_id).ok_or("no active document")?;
+        Ok(f(&mut doc.table))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -743,14 +1004,11 @@ async fn open_file(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<FileMeta, String> {
-    let inner = state.table.clone();
     let open_path = path.clone();
     let mtime = get_file_mtime_ms(&open_path);
 
     let (table, newline_format, encoding) = tauri::async_runtime::spawn_blocking(move || -> Result<(PieceTable, String, String), String> {
         let file = File::open(&path).map_err(|e| e.to_string())?;
-        // SAFETY: as with any mmap, behaviour is undefined if another process truncates the
-        // file while it is mapped. That is the standard, unavoidable caveat of this approach.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
 
         let sample_len = mmap.len().min(64 * 1024);
@@ -758,11 +1016,11 @@ async fn open_file(
         let encoding = detect_text_encoding(&mmap[..sample_len]).to_string();
 
         let total_bytes = mmap.len();
-        let newlines = scan_newlines(&mmap, |scanned| {
+        let (newlines, _total_lines) = scan_newlines(&mmap, |lines_scanned| {
             let _ = app.emit(
                 "scan-progress",
                 ScanProgress {
-                    bytes_scanned: scanned,
+                    bytes_scanned: lines_scanned,
                     total_bytes,
                 },
             );
@@ -778,9 +1036,14 @@ async fn open_file(
         newline: newline_format,
         encoding,
     };
-    *inner.lock().map_err(|e| e.to_string())? = Some(table);
-    *state.path.lock().map_err(|e| e.to_string())? = Some(PathBuf::from(open_path));
-    *state.last_modified_ms.lock().map_err(|e| e.to_string())? = mtime;
+    
+    let active_id = state.active_id.lock().unwrap().clone();
+    let mut docs = state.documents.write().map_err(|e| e.to_string())?;
+    let doc = docs.get_mut(&active_id).ok_or("no active document")?;
+    doc.table = table;
+    doc.path = Some(PathBuf::from(open_path));
+    doc.last_modified_ms = mtime;
+    
     Ok(meta)
 }
 
@@ -790,27 +1053,34 @@ async fn save_file(
     state: State<'_, AppState>,
     path: Option<String>,
 ) -> Result<FileMeta, String> {
+    let active_id = state.active_id.lock().unwrap().clone();
     let target = match path {
         Some(path) => PathBuf::from(path),
-        None => state
-            .path
-            .lock()
-            .map_err(|e| e.to_string())?
-            .clone()
-            .ok_or("no file path selected")?,
+        None => {
+            let docs = state.documents.write().unwrap();
+            let doc = docs.get(&active_id).ok_or("no active document")?;
+            doc.path.clone().ok_or("no file path selected")?
+        }
     };
-    let inner = state.table.clone();
+    
+    let documents = state.documents.clone();
     let meta = tauri::async_runtime::spawn_blocking({
         let target = target.clone();
+        let active_id = active_id.clone();
         move || {
-            let guard = inner.lock().map_err(|e| e.to_string())?;
-            let table = guard.as_ref().ok_or("no file open")?;
+            let guard = documents.read().map_err(|e| e.to_string())?;
+            let doc = guard.get(&active_id).ok_or("no active document")?;
+            let table = &doc.table;
             let mut temporary = target.clone();
             temporary.set_extension(format!("gfe-tmp-{}", std::process::id()));
             let result = (|| -> Result<FileMeta, String> {
                 let mut output = File::create(&temporary).map_err(|e| e.to_string())?;
                 for piece in &table.pieces {
-                    output.write_all(table.piece_bytes(piece)).map_err(|e| e.to_string())?;
+                    let bytes = table.piece_bytes(piece);
+                    output.write_all(bytes).map_err(|e| e.to_string())?;
+                    if let Source::Original = piece.source {
+                        release_memory(bytes);
+                    }
                 }
                 output.sync_all().map_err(|e| e.to_string())?;
                 fs::rename(&temporary, &target).map_err(|e| e.to_string())?;
@@ -822,32 +1092,38 @@ async fn save_file(
                     encoding: detect_text_encoding(&sample).to_string(),
                 })
             })();
-            if result.is_err() { let _ = fs::remove_file(&temporary); }
+            if result.is_err() {
+                let _ = fs::remove_file(&temporary);
+            }
             result
         }
     })
     .await
     .map_err(|e| e.to_string())??;
-    let new_mtime = get_file_mtime_ms(&target.to_string_lossy());
-    *state.path.lock().map_err(|e| e.to_string())? = Some(target);
-    *state.last_modified_ms.lock().map_err(|e| e.to_string())? = new_mtime;
+
+    let mut guard = state.documents.write().unwrap();
+    let doc = guard.get_mut(&active_id).unwrap();
+    doc.path = Some(target.clone());
+    doc.last_modified_ms = get_file_mtime_ms(&target.to_string_lossy());
     Ok(meta)
 }
 
 /// Checks if the currently opened file on disk has been modified externally.
 #[tauri::command]
 async fn check_file_changed(state: State<'_, AppState>) -> Result<bool, String> {
-    let path_opt = state.path.lock().map_err(|e| e.to_string())?.clone();
-    let path = match path_opt {
+    let active_id = state.active_id.lock().unwrap().clone();
+    let docs = state.documents.write().unwrap();
+    let doc = docs.get(&active_id).ok_or("no active document")?;
+    
+    let path = match &doc.path {
         Some(p) => p,
         None => return Ok(false),
     };
-    let recorded_mtime = *state.last_modified_ms.lock().map_err(|e| e.to_string())?;
+    let recorded_mtime = doc.last_modified_ms;
     if recorded_mtime == 0 {
         return Ok(false);
     }
     let current_mtime = get_file_mtime_ms(&path.to_string_lossy());
-    // If mtime is newer by more than a tiny tolerance (10ms)
     Ok(current_mtime > recorded_mtime)
 }
 
@@ -859,7 +1135,7 @@ async fn get_lines(
     start_line: usize,
     end_line: usize,
 ) -> Result<String, String> {
-    with_table(&state, move |table| {
+    with_table_read(&state, move |table| {
         table.get_lines(start_line.saturating_sub(1), end_line)
     })
     .await
@@ -874,7 +1150,7 @@ async fn insert_text(
     column: usize,
     text: String,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let offset = table.offset_of_position(line, column);
         table.insert_text(offset, &text);
         table.total_lines()
@@ -891,7 +1167,7 @@ async fn delete_text(
     end_line: usize,
     end_column: usize,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let start = table.offset_of_position(start_line, start_column);
         let end = table.offset_of_position(end_line, end_column);
         table.delete_text(start, end.saturating_sub(start));
@@ -907,7 +1183,7 @@ async fn byte_offset(
     line: usize,
     column: usize,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| table.offset_of_position(line, column))
+    with_table_read(&state, move |table| table.offset_of_position(line, column))
         .await
 }
 
@@ -916,7 +1192,7 @@ async fn position_at_byte(
     state: State<'_, AppState>,
     offset: usize,
 ) -> Result<(usize, usize), String> {
-    with_table(&state, move |table| table.position_of_offset(offset.min(table.total_length())))
+    with_table_read(&state, move |table| table.position_of_offset(offset.min(table.total_length())))
         .await
 }
 
@@ -932,6 +1208,7 @@ async fn search_text(
     whole_word: bool,
     regex: bool,
 ) -> Result<SearchResult, String> {
+    state.active_search_id.store(request_id, Ordering::Relaxed);
     let regex_engine = if regex {
         Some(
             RegexBuilder::new(&query)
@@ -943,32 +1220,36 @@ async fn search_text(
     } else {
         None
     };
-    with_table(&state, move |table| {
-        let matches = if regex {
+    let active_search_id = state.active_search_id.clone();
+    with_table_read(&state, move |table| {
+        let (matches, total_matches) = if regex {
             search_regex_document(
                 table,
                 regex_engine.as_ref().expect("regex engine is present"),
                 whole_word,
-            )
+                Some(&active_search_id),
+                request_id,
+            )?
         } else {
             let pattern = if match_case {
                 query.as_bytes().to_vec()
             } else {
                 fold_bytes(query.as_bytes())
             };
-            search_document_with_progress(
+            let (hits, total) = search_document_with_progress(
                 table,
                 &pattern,
                 !match_case,
                 whole_word,
                 Some(&app),
+                Some(&active_search_id),
                 request_id,
-            )
-            .into_iter()
-            .map(|offset| (offset, pattern.len()))
-            .collect()
+            )?;
+            let mapped_hits = hits.into_iter()
+                .map(|offset| (offset, pattern.len()))
+                .collect();
+            (mapped_hits, total)
         };
-        let total_matches = matches.len();
         let hits = matches
             .iter()
             .take(MAX_REPORTED_HITS)
@@ -985,13 +1266,63 @@ async fn search_text(
                 }
             })
             .collect();
-        SearchResult {
+        Ok(SearchResult {
             total_matches,
             truncated: total_matches > MAX_REPORTED_HITS,
             hits,
-        }
+        })
     })
-    .await
+    .await?
+}
+
+#[tauri::command]
+fn cancel_search(state: State<'_, AppState>) {
+    state.active_search_id.store(0, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn switch_document(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let docs = state.documents.write().map_err(|e| e.to_string())?;
+    if !docs.contains_key(&id) {
+        return Err("document not found".to_string());
+    }
+    *state.active_id.lock().unwrap() = id;
+    state.active_search_id.store(0, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn new_document(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut docs = state.documents.write().map_err(|e| e.to_string())?;
+    docs.insert(id.clone(), DocumentState {
+        table: empty_piece_table(),
+        path: None,
+        last_modified_ms: 0,
+    });
+    *state.active_id.lock().unwrap() = id;
+    state.active_search_id.store(0, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn close_tab(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let mut docs = state.documents.write().map_err(|e| e.to_string())?;
+    if docs.len() <= 1 {
+        // Can't close the last tab, just reset it
+        let doc = docs.values_mut().next().unwrap();
+        doc.table = empty_piece_table();
+        doc.path = None;
+        doc.last_modified_ms = 0;
+        return Ok(docs.keys().next().unwrap().clone());
+    }
+    
+    docs.remove(&id);
+    
+    let mut active_id = state.active_id.lock().unwrap();
+    if *active_id == id {
+        *active_id = docs.keys().next().unwrap().clone();
+    }
+    Ok(active_id.clone())
 }
 
 /// Replaces a single match range and returns the new document line count.
@@ -1004,7 +1335,7 @@ async fn replace_match(
     end_column: usize,
     text: String,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let start = table.offset_of_position(start_line, start_column);
         let end = table.offset_of_position(end_line, end_column);
         let len = end.saturating_sub(start);
@@ -1044,30 +1375,34 @@ async fn replace_all(
         None
     };
 
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let matches: Vec<(usize, usize)> = if regex {
-            search_regex_document(
+            let (hits, _) = search_regex_document(
                 table,
                 regex_engine.as_ref().expect("regex engine is present"),
                 whole_word,
-            )
+                None,
+                0,
+            )?;
+            hits
         } else {
             let pattern = if match_case {
                 query.as_bytes().to_vec()
             } else {
                 fold_bytes(query.as_bytes())
             };
-            search_document_with_progress(
+            let (hits, _) = search_document_with_progress(
                 table,
                 &pattern,
                 !match_case,
                 whole_word,
                 None,
+                None,
                 0,
-            )
-            .into_iter()
-            .map(|offset| (offset, pattern.len()))
-            .collect()
+            )?;
+            hits.into_iter()
+                .map(|offset| (offset, pattern.len()))
+                .collect()
         };
 
         let replaced_count = matches.len();
@@ -1081,12 +1416,12 @@ async fn replace_all(
             }
         }
 
-        ReplaceAllResult {
+        Ok(ReplaceAllResult {
             replaced_count,
             total_lines: table.total_lines(),
-        }
+        })
     })
-    .await
+    .await?
 }
 
 /// Converts line endings across the piece table to either LF or CRLF.
@@ -1095,7 +1430,7 @@ async fn convert_line_endings(
     state: State<'_, AppState>,
     target_format: String,
 ) -> Result<FileMeta, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let total = table.total_length();
         let bytes = table.get_bytes_range(0, total);
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
@@ -1147,6 +1482,10 @@ pub fn run() {
             replace_all,
             check_file_changed,
             convert_line_endings,
+            cancel_search,
+            switch_document,
+            new_document,
+            close_tab,
             startup_path
         ])
         .run(tauri::generate_context!())
@@ -1170,7 +1509,7 @@ mod tests {
         f.sync_all().unwrap();
         let mmap = unsafe { Mmap::map(&File::open(&path).unwrap()) }.unwrap();
         let _ = std::fs::remove_file(&path); // unlinked but still mapped
-        let nl = scan_newlines(&mmap, |_| {});
+        let (nl, _count) = scan_newlines(&mmap, |_| {});
         PieceTable::new(Arc::new(mmap), Arc::new(nl))
     }
 
@@ -1303,7 +1642,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            search_regex_document(&t, &regex, false),
+            search_regex_document(&t, &regex, false, None, 0).unwrap(),
             vec![(0, 5), (6, 8), (15, 5)]
         );
     }
@@ -1316,7 +1655,7 @@ mod tests {
             .unicode(false)
             .build()
             .unwrap();
-        assert_eq!(search_regex_document(&t, &regex, true), vec![(0, 5), (15, 5)]);
+        assert_eq!(search_regex_document(&t, &regex, true, None, 0).unwrap(), vec![(0, 5), (15, 5)]);
     }
 
     #[test]
@@ -1366,5 +1705,26 @@ mod tests {
 
         assert_eq!(detect_newline_format(whole(&t).as_bytes()), "LF");
         assert_eq!(whole(&t), "line 1\nline 2\nline 3\n");
+    }
+
+    #[test]
+    fn search_can_be_cancelled() {
+        let t = table("aaaa");
+        let active = AtomicU64::new(1);
+        
+        // request_id matches active -> search continues
+        let hits = search_document_with_progress(&t, b"aa", false, false, None, Some(&active), 1).unwrap();
+        assert_eq!(hits, vec![0, 1, 2]);
+
+        // request_id differs -> search cancels
+        let res = search_document_with_progress(&t, b"aa", false, false, None, Some(&active), 2);
+        assert!(res.is_err());
+        assert_eq!(res.err().unwrap(), "search cancelled");
+
+        // regex search also cancels
+        let regex = RegexBuilder::new("aa").build().unwrap();
+        let res_reg = search_regex_document(&t, &regex, false, Some(&active), 2);
+        assert!(res_reg.is_err());
+        assert_eq!(res_reg.err().unwrap(), "search cancelled");
     }
 }

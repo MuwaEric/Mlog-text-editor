@@ -8,6 +8,7 @@ import editorWorker from "monaco-editor/editor/editor.worker.js?worker";
 self.MonacoEnvironment = { getWorker: () => new editorWorker() };
 
 // Monaco's model holds a bounded WINDOW of the file, never the whole thing. Giving it the real
+let setupKeybindings: (ed: monaco.editor.IStandaloneCodeEditor) => void = () => {};
 // line count is fatal twice over: the model allocates per-line state for every line, and the
 // compositor allocates tile memory for a scroll layer lineCount * lineHeight pixels tall (1M
 // lines is ~19 million pixels, which exhausted RAM as soon as the user scrolled).
@@ -39,6 +40,7 @@ interface Prefs {
   matchCase: boolean;
   readOnly: boolean;
   windowLines: number;
+  shortcuts: Record<string, string>;
 }
 
 const DEFAULT_PREFS: Prefs = {
@@ -58,6 +60,18 @@ const DEFAULT_PREFS: Prefs = {
   matchCase: false,
   readOnly: false,
   windowLines: 4000,
+  shortcuts: {
+    "open-file": "Ctrl+O",
+    "save-file": "Ctrl+S",
+    "save-as": "Ctrl+Shift+S",
+    "new-tab": "Ctrl+T",
+    "close-tab": "Ctrl+W",
+    "goto": "Ctrl+G",
+    "find": "Ctrl+F",
+    "replace": "Ctrl+H",
+    "undo": "Ctrl+Z",
+    "redo": "Ctrl+Y",
+  },
 };
 
 const PREFS_KEY = "gfe.prefs";
@@ -139,6 +153,7 @@ function savePrefs() {
 
 function applyPrefs() {
   monaco.editor.setTheme(prefs.theme);
+  if (!editor) return;
   editor.updateOptions({
     fontSize: prefs.fontSize,
     fontFamily: prefs.fontFamily.trim() || defaultFontFamily,
@@ -191,7 +206,7 @@ interface SearchProgress {
   hits: SearchHit[];
 }
 
-let editor: monaco.editor.IStandaloneCodeEditor;
+let editor: monaco.editor.IStandaloneCodeEditor | null = null;
 let totalLines = 1;
 let windowStart = 1; // file line shown as model line 1
 let windowCount = 0; // lines currently in the model
@@ -214,6 +229,10 @@ let streamedNavigationRequestId: number | null = null;
 let positionRequestId = 0;
 let currentPath: string | null = null;
 let dirty = false;
+let currentTabId = "default";
+let tabs: { id: string; path: string | null; dirty: boolean }[] = [
+  { id: "default", path: null, dirty: false },
+];
 
 const RECOVERY_KEY = "gfe.recovery";
 const LINE_CACHE_KEY = "gfe.line-cache";
@@ -308,12 +327,25 @@ function updateSearchDecorations() {
   );
 }
 
-function setStatus(message: string) {
+function setStatus(message: string, isPersistentMetadata: boolean = false) {
   const el = document.querySelector<HTMLElement>("#status");
-  if (el) el.textContent = message;
+  if (el) {
+    if (isPersistentMetadata) {
+      el.textContent = "";
+    } else {
+      el.textContent = message;
+    }
+  }
+
+  const prefEl = document.querySelector<HTMLElement>("#pref-metadata");
+  if (prefEl) prefEl.textContent = message || "No file open";
+
+  const locationEl = document.querySelector<HTMLElement>("#pref-location");
+  if (locationEl) locationEl.textContent = currentPath || "No file open";
 }
 
 function updateDocumentState() {
+  const closeBtn = document.querySelector<HTMLButtonElement>("#close-btn");
   const save = document.querySelector<HTMLButtonElement>("#save-btn");
   const saveAs = document.querySelector<HTMLButtonElement>("#save-as-btn");
   const gotoBtn = document.querySelector<HTMLButtonElement>("#goto-btn");
@@ -321,12 +353,21 @@ function updateDocumentState() {
   const convertLf = document.querySelector<HTMLButtonElement>("#convert-lf-btn");
   const replaceBtn = document.querySelector<HTMLButtonElement>("#replace-btn");
   const replaceAllBtn = document.querySelector<HTMLButtonElement>("#replace-all-btn");
-  const name = document.querySelector<HTMLElement>("#file-name");
 
   const hasModel = !!editor?.getModel();
   const hasFile = Boolean(currentPath);
   const isReadOnly = prefs.readOnly;
 
+  const welcomeView = document.querySelector<HTMLElement>("#welcome-view");
+  if (welcomeView) {
+    if (hasFile) {
+      welcomeView.classList.add("hidden");
+    } else {
+      welcomeView.classList.remove("hidden");
+    }
+  }
+
+  if (closeBtn) closeBtn.disabled = !hasFile;
   if (save) save.disabled = !hasModel || !dirty || isReadOnly;
   if (saveAs) saveAs.disabled = !hasModel || isReadOnly;
   if (gotoBtn) gotoBtn.disabled = !hasFile;
@@ -334,16 +375,6 @@ function updateDocumentState() {
   if (convertLf) convertLf.disabled = !hasFile || isReadOnly;
   if (replaceBtn) replaceBtn.disabled = !hasFile || isReadOnly;
   if (replaceAllBtn) replaceAllBtn.disabled = !hasFile || isReadOnly;
-  if (name) {
-    const readOnlyTag = isReadOnly ? " [Read-Only]" : "";
-    if (hasFile) {
-      name.textContent = `${currentPath!.split("/").pop() ?? currentPath}${dirty ? " *" : ""}${readOnlyTag}`;
-    } else if (hasModel) {
-      name.textContent = `Untitled${dirty ? " *" : ""}${readOnlyTag}`;
-    } else {
-      name.textContent = `No file open`;
-    }
-  }
 }
 
 function updateHistoryControls() {
@@ -364,14 +395,21 @@ async function saveDocument(path: string | null = currentPath) {
   const meta = await invoke<FileMeta>("save_file", { path });
   currentPath = path;
   dirty = false;
+  const tab = tabs.find(t => t.id === currentTabId);
+  if (tab) {
+    tab.path = path;
+    tab.dirty = false;
+  }
   clearRecoveryState();
   updateDocumentState();
-  setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} saved`);
+  updateTabsUI();
+  setStatus(`${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} saved`, true);
 }
 
 async function convertLineEndingsTo(target: "LF" | "CRLF") {
   if (!currentPath) {
-    return setStatus("No file open to convert line endings");
+    setStatus("No file open to convert line endings", false);
+    return;
   }
   setStatus(`Converting line endings to ${target}…`);
   await pendingEdits;
@@ -383,7 +421,7 @@ async function convertLineEndingsTo(target: "LF" | "CRLF") {
   await anchorWindow(viewTop);
   scrollToViewTop();
   updateScrollbar();
-  setStatus(`Converted line endings to ${meta.newline} (${meta.total_lines.toLocaleString()} lines)`);
+  setStatus(`Converted line endings to ${meta.newline} (${meta.total_lines.toLocaleString()} lines)`, true);
 }
 
 function wireExternalChangeDialog() {
@@ -446,10 +484,13 @@ function wireGotoDialog() {
     void (async () => {
       if (value.startsWith("byte:")) {
         const offset = Number(value.slice(5).trim());
-        if (!Number.isSafeInteger(offset) || offset < 0) return setStatus("Invalid byte offset");
+        if (!Number.isSafeInteger(offset) || offset < 0) {
+          setStatus("Invalid byte offset", false);
+          return;
+        }
         const [line, column] = await invoke<[number, number]>("position_at_byte", { offset });
         await goToLine(line);
-        editor.setPosition({ lineNumber: toModelLine(line), column });
+        editor?.setPosition({ lineNumber: toModelLine(line), column });
         close();
         return;
       }
@@ -457,12 +498,13 @@ function wireGotoDialog() {
       const line = parts[0];
       const column = parts.length > 1 ? parts[1] : 1;
       if (!Number.isSafeInteger(line) || line < 1 || !Number.isSafeInteger(column) || column < 1) {
-        return setStatus("Invalid line or column");
+        setStatus("Invalid line or column", false);
+        return;
       }
       await goToLine(line);
-      editor.setPosition({ lineNumber: toModelLine(line), column });
+      editor?.setPosition({ lineNumber: toModelLine(line), column });
       close();
-    })().catch((err) => setStatus(`Navigation failed: ${err}`));
+    })().catch((err) => setStatus(`Navigation failed: ${err}`, false));
   };
 
   submitBtn?.addEventListener("click", submit);
@@ -500,7 +542,7 @@ function updatePosition(modelLine: number, column: number) {
   if (!position) return;
   const fileLine = toFileLine(modelLine);
   position.textContent = `Ln ${fileLine.toLocaleString()}, Col ${column.toLocaleString()}`;
-  if (!currentPath) return;
+  if (!currentPath || !editor) return;
   const requestId = ++positionRequestId;
   void invoke<number>("byte_offset", { line: fileLine, column })
     .then((offset) => {
@@ -512,11 +554,13 @@ function updatePosition(modelLine: number, column: number) {
 }
 
 function lineHeight(): number {
+  if (!editor) return 20;
   return editor.getOption(monaco.editor.EditorOption.lineHeight);
 }
 
 /** First and last *model* lines on screen. Reflects wrapping, unlike scrollTop arithmetic. */
 function visibleModelRange(): { start: number; end: number } | null {
+  if (!editor) return null;
   const ranges = editor.getVisibleRanges();
   if (!ranges.length) return null;
   return {
@@ -528,6 +572,7 @@ function visibleModelRange(): { start: number; end: number } | null {
 function linesPerScreen(): number {
   const r = visibleModelRange();
   if (r) return Math.max(1, r.end - r.start + 1);
+  if (!editor) return 20;
   return Math.max(1, Math.floor(editor.getLayoutInfo().height / lineHeight()));
 }
 
@@ -536,8 +581,54 @@ function maxViewTop(): number {
 }
 
 /** Loads a fresh window of lines into the model, starting at `start`. */
-async function anchorWindow(start: number) {
+let anchorWindow = async (start: number) => {
   if (!currentPath) return;
+  
+  if (!editor) {
+    const container = document.querySelector<HTMLDivElement>("#editor-container");
+    if (!container) return;
+    editor = monaco.editor.create(container, {
+      value: "",
+      language: "plaintext",
+      automaticLayout: true,
+      scrollBeyondLastLine: false,
+      scrollbar: { vertical: "hidden", verticalScrollbarSize: 0 },
+      hover: { showLongLineWarning: false },
+      maxTokenizationLineLength: 10000,
+    });
+    
+    editor.onDidScrollChange(() => {
+      if (syncing) return;
+      const r = visibleModelRange();
+      if (!r) return;
+      viewTop = toFileLine(r.start);
+      if (currentPath) {
+        const pos = editor?.getPosition();
+        writeLineCache(currentPath, {
+          line: viewTop,
+          column: pos ? pos.column : 1,
+        });
+      }
+      updateScrollbar();
+      void maybeReanchor();
+    });
+    editor.onDidLayoutChange(() => updateScrollbar());
+    editor.onDidChangeCursorPosition(({ position }) => {
+      if (!syncing) {
+        updatePosition(position.lineNumber, position.column);
+        if (currentPath) {
+          writeLineCache(currentPath, {
+            line: viewTop,
+            column: position.column,
+          });
+        }
+      }
+    });
+    
+    wireEditEvents();
+    applyPrefs();
+  }
+
   const maxStart = Math.max(1, totalLines - windowLines() + 1);
   const newStart = Math.min(Math.max(1, Math.round(start)), maxStart);
   const end = Math.min(newStart + windowLines() - 1, totalLines);
@@ -550,7 +641,7 @@ async function anchorWindow(start: number) {
   // Every line arrives newline-terminated; keeping the last one would add a phantom empty line.
   const text = end < totalLines ? raw.replace(/\n$/, "") : raw;
 
-  const model = editor.getModel();
+  const model = editor?.getModel();
   if (!model) return;
   syncing = true;
   model.setValue(text);
@@ -561,6 +652,7 @@ async function anchorWindow(start: number) {
 }
 
 function scrollToViewTop() {
+  if (!editor) return;
   syncing = true;
   // getTopForLineNumber accounts for wrapped lines; scrollTop/lineHeight would not.
   const modelLine = Math.min(
@@ -638,6 +730,23 @@ function wireScrollbar() {
   if (!track || !thumb) return;
 
   let dragging = false;
+  let dragRequestedLine = -1;
+  let dragPending = false;
+
+  const processDrag = async () => {
+    if (dragRequestedLine === -1) {
+      dragPending = false;
+      return;
+    }
+    const line = dragRequestedLine;
+    dragRequestedLine = -1;
+    await goToLine(line);
+    if (dragRequestedLine !== -1) {
+      requestAnimationFrame(() => void processDrag());
+    } else {
+      dragPending = false;
+    }
+  };
 
   const lineFromClientY = (clientY: number) => {
     const rect = track.getBoundingClientRect();
@@ -653,7 +762,18 @@ function wireScrollbar() {
     e.preventDefault();
   });
   thumb.addEventListener("pointermove", (e) => {
-    if (dragging) void goToLine(lineFromClientY(e.clientY));
+    if (dragging) {
+      const targetLine = lineFromClientY(e.clientY);
+      // Update viewTop immediately for scrollbar visual feedback
+      viewTop = Math.min(Math.max(1, Math.round(targetLine)), maxViewTop());
+      updateScrollbar();
+
+      dragRequestedLine = targetLine;
+      if (!dragPending) {
+        dragPending = true;
+        requestAnimationFrame(() => void processDrag());
+      }
+    }
   });
   const stop = (e: PointerEvent) => {
     dragging = false;
@@ -670,7 +790,7 @@ function wireScrollbar() {
 // --- file loading -----------------------------------------------------------------------------
 
 async function openFile(path: string) {
-  setStatus("Opening & scanning line offsets…");
+  setStatus("Opening & scanning line offsets…", false);
   const meta = await invoke<FileMeta>("open_file", { path });
   totalLines = meta.total_lines;
   windowStart = 1;
@@ -686,7 +806,16 @@ async function openFile(path: string) {
   if (nameEl) nameEl.textContent = path.split("/").pop() ?? path;
   currentPath = path;
   dirty = false;
+  const tab = tabs.find(t => t.id === currentTabId);
+  if (tab) {
+    tab.path = path;
+    tab.dirty = false;
+  }
   updateDocumentState();
+  updateTabsUI();
+
+  const welcome = document.querySelector<HTMLElement>("#welcome-view");
+  if (welcome) welcome.hidden = true;
 
   hits = [];
   hitIndex = -1;
@@ -699,15 +828,127 @@ async function openFile(path: string) {
 
   const modelLine = toModelLine(targetFileLine);
   if (modelLine >= 1 && modelLine <= windowCount) {
-    editor.setPosition({ lineNumber: modelLine, column: targetCol });
+    editor?.setPosition({ lineNumber: modelLine, column: targetCol });
   }
 
   const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} · ${meta.encoding}`;
   setStatus(
     hasUnsavedRecovery
       ? `${baseStatus} (⚠️ previous session had unsaved changes)`
-      : baseStatus
+      : baseStatus,
+    true
   );
+}
+
+async function closeFile() {
+  await closeTab(currentTabId);
+}
+
+function updateTabsUI() {
+  const container = document.querySelector("#tabs-container");
+  if (!container) return;
+  container.innerHTML = "";
+  tabs.forEach((tab) => {
+    const el = document.createElement("div");
+    el.className = `tab${tab.id === currentTabId ? " active" : ""}`;
+    const name = tab.path ? tab.path.split("/").pop() ?? tab.path : "Untitled";
+    const readOnlyTag = prefs.readOnly ? " [RO]" : "";
+    el.innerHTML = `
+      <span class="tab-name">${name}${tab.dirty ? " *" : ""}${readOnlyTag}</span>
+      <span class="tab-close" title="Close Tab">✕</span>
+    `;
+    el.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).classList.contains("tab-close")) {
+        void closeTab(tab.id);
+      } else {
+        void switchTab(tab.id);
+      }
+    });
+    container.appendChild(el);
+  });
+}
+
+async function switchTab(id: string) {
+  if (id === currentTabId) return;
+  await invoke("switch_document", { id });
+  currentTabId = id;
+  const tab = tabs.find((t) => t.id === id)!;
+  currentPath = tab.path;
+  dirty = tab.dirty;
+
+  if (currentPath) {
+    // Re-open/refresh the editor for this file
+    // We need to fetch the file meta to restore state
+    const meta = await invoke<FileMeta>("open_file", { path: currentPath });
+    totalLines = meta.total_lines;
+    const cachedPos = readLineCache()[currentPath];
+    viewTop = cachedPos?.line ?? 1;
+    await anchorWindow(viewTop);
+  } else {
+    totalLines = 0;
+    if (editor) editor.setValue("");
+  }
+  
+  updateDocumentState();
+  updateTabsUI();
+  updateScrollbar();
+  updateHitControls();
+  updateSearchDecorations();
+
+  if (currentPath) {
+    const meta = await invoke<FileMeta>("open_file", { path: currentPath });
+    const baseStatus = `${meta.total_lines.toLocaleString()} lines · ${meta.size_bytes.toLocaleString()} bytes · ${meta.newline} · ${meta.encoding}`;
+    setStatus(baseStatus, true);
+    const pos = editor?.getPosition();
+    if (pos) updatePosition(pos.lineNumber, pos.column);
+  } else {
+    setStatus("No file open", true);
+  }
+}
+
+async function newTab() {
+  const id = Math.random().toString(36).substring(7);
+  await invoke("new_document", { id });
+  tabs.push({ id, path: null, dirty: false });
+  void switchTab(id);
+}
+
+async function closeTab(id: string) {
+  const tab = tabs.find((t) => t.id === id);
+  if (tab?.dirty && !confirm(`Unsaved changes in ${tab.path ?? "Untitled"}. Close anyway?`)) {
+    return;
+  }
+  
+  const nextActiveId = await invoke<string>("close_tab", { id });
+  if (tabs.length > 1) {
+    tabs = tabs.filter((t) => t.id !== id);
+  } else {
+    // Last tab was reset
+    tabs[0].path = null;
+    tabs[0].dirty = false;
+  }
+  
+  if (currentTabId === id) {
+    currentTabId = nextActiveId;
+    const nextTab = tabs.find((t) => t.id === nextActiveId)!;
+    currentPath = nextTab.path;
+    dirty = nextTab.dirty;
+    if (currentPath) {
+        void switchTab(nextActiveId);
+    } else {
+        totalLines = 0;
+        if (editor) editor.setValue("");
+        updateDocumentState();
+        updateTabsUI();
+        updateScrollbar();
+        updateHitControls();
+        updateSearchDecorations();
+        currentPath = null;
+        setStatus("No file open", true);
+    }
+  } else {
+    updateTabsUI();
+  }
 }
 
 /**
@@ -715,6 +956,7 @@ async function openFile(path: string) {
  * lines are window-relative, so both are translated before crossing the IPC boundary.
  */
 function wireEditEvents() {
+  if (!editor) return;
   editor.onDidChangeModelContent((e) => {
     if (syncing || prefs.readOnly) return;
 
@@ -744,19 +986,25 @@ function wireEditEvents() {
         .catch((err) => setStatus(`Edit failed: ${err}`));
     }
 
-    const model = editor.getModel();
+    const model = editor?.getModel();
     if (model) windowCount = model.getLineCount();
     updateScrollbar();
     dirty = true;
+    const tab = tabs.find(t => t.id === currentTabId);
+    if (tab) tab.dirty = true;
     updateDocumentState();
+    updateTabsUI();
     updateHistoryControls();
     persistRecoveryState();
   });
 }
 
 async function runSearch(query: string) {
-  if (!currentPath) return setStatus("Open a file to search");
-  if (!query) return;
+  if (!currentPath) {
+    setStatus("Open a file to search", false);
+    return;
+  }
+  
   const requestId = ++searchRequestId;
   activeSearchRequestId = requestId;
   streamedNavigationRequestId = null;
@@ -764,6 +1012,15 @@ async function runSearch(query: string) {
   hitIndex = -1;
   updateSearchDecorations();
   updateHitControls();
+
+  if (!query) {
+    lastQuery = "";
+    setStatus("");
+    void invoke("cancel_search");
+    updateSearchMarkers();
+    return;
+  }
+
   const matchCase =
     document.querySelector<HTMLInputElement>("#match-case")?.checked ?? false;
   const wholeWord =
@@ -794,8 +1051,28 @@ async function runSearch(query: string) {
   lastRegex = regex;
   updateSearchDecorations();
   updateHitControls();
+  updateSearchMarkers();
 
   if (hits.length > 0) await gotoHit(0);
+}
+
+
+function updateSearchMarkers() {
+  const track = document.querySelector<HTMLElement>("#vscroll");
+  if (!track) return;
+  track.querySelectorAll(".search-marker").forEach((el) => el.remove());
+  if (hits.length === 0 || hits.length > 5000) return;
+  const trackH = track.clientHeight;
+  const fragment = document.createDocumentFragment();
+  for (let i = 0; i < hits.length; i++) {
+    const hit = hits[i];
+    const pos = (hit.line - 1) / Math.max(1, totalLines - 1);
+    const marker = document.createElement("div");
+    marker.className = "search-marker";
+    marker.style.top = `${Math.round(pos * trackH)}px`;
+    fragment.appendChild(marker);
+  }
+  track.appendChild(fragment);
 }
 
 function updateHitControls() {
@@ -847,15 +1124,27 @@ function jumpToResultInput() {
 }
 
 async function replaceCurrentMatch() {
-  if (prefs.readOnly) return setStatus("Cannot replace: editor is in read-only mode");
-  if (!currentPath) return setStatus("Open a file first");
+  if (prefs.readOnly) {
+    setStatus("Cannot replace: editor is in read-only mode", false);
+    return;
+  }
+  if (!currentPath) {
+    setStatus("Open a file first", false);
+    return;
+  }
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
   const query = searchInput?.value ?? "";
-  if (!query) return setStatus("Enter search text to replace");
+  if (!query) {
+    setStatus("Enter search text to replace", false);
+    return;
+  }
 
   if (hitIndex < 0 || hitIndex >= hits.length) {
     await runSearch(query);
-    if (hits.length === 0) return setStatus("No matches found to replace");
+    if (hits.length === 0) {
+      setStatus("No matches found to replace", false);
+      return;
+    }
   }
 
   const hit = hits[hitIndex];
@@ -884,12 +1173,21 @@ async function replaceCurrentMatch() {
 }
 
 async function replaceAllMatches() {
-  if (prefs.readOnly) return setStatus("Cannot replace: editor is in read-only mode");
-  if (!currentPath) return setStatus("Open a file first");
+  if (prefs.readOnly) {
+    setStatus("Cannot replace: editor is in read-only mode", false);
+    return;
+  }
+  if (!currentPath) {
+    setStatus("Open a file first", false);
+    return;
+  }
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
-  const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
   const query = searchInput?.value ?? "";
-  if (!query) return setStatus("Enter search text to replace all");
+  if (!query) {
+    setStatus("Enter search text to replace all", false);
+    return;
+  }
+  const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
   const replacement = replaceInput?.value ?? "";
 
   const matchCase =
@@ -945,8 +1243,8 @@ async function gotoHit(index: number) {
       hit.end_column
     );
     syncing = true;
-    editor.setSelection(range);
-    editor.revealRangeInCenter(range, monaco.editor.ScrollType.Immediate);
+    editor?.setSelection(range);
+    editor?.revealRangeInCenter(range, monaco.editor.ScrollType.Immediate);
     syncing = false;
     updatePosition(startLine, hit.column);
   }
@@ -989,6 +1287,14 @@ function syncPrefControls() {
   set("#pref-match-case", (el) => (el.checked = prefs.matchCase));
   set("#pref-read-only", (el) => (el.checked = prefs.readOnly));
   set("#pref-window-lines", (el) => (el.value = String(prefs.windowLines)));
+  
+  document.querySelectorAll<HTMLInputElement>(".shortcut-input").forEach((el) => {
+    const action = el.getAttribute("data-action");
+    if (action && action in prefs.shortcuts) {
+      el.value = prefs.shortcuts[action];
+    }
+  });
+
   set("#word-wrap", (el) => (el.checked = prefs.wordWrap));
   set("#match-case", (el) => (el.checked = prefs.matchCase));
   set("#read-only", (el) => (el.checked = prefs.readOnly));
@@ -1094,16 +1400,128 @@ function wirePreferences() {
     ?.addEventListener("change", (e) => {
       void updatePref("fontFamily", (e.target as HTMLInputElement).value);
     });
+
+  document.querySelectorAll<HTMLInputElement>(".shortcut-input").forEach((input) => {
+    input.addEventListener("focus", () => {
+      input.value = "Press keys...";
+    });
+    input.addEventListener("blur", () => {
+      const action = input.getAttribute("data-action");
+      if (action) input.value = prefs.shortcuts[action] || "";
+    });
+    input.addEventListener("keydown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.key === "Escape") {
+        input.blur();
+        return;
+      }
+
+      if (e.key === "Control" || e.key === "Shift" || e.key === "Alt" || e.key === "Meta") {
+        return;
+      }
+
+      const parts: string[] = [];
+      if (e.ctrlKey) parts.push("Ctrl");
+      if (e.shiftKey) parts.push("Shift");
+      if (e.altKey) parts.push("Alt");
+      if (e.metaKey) parts.push("Meta");
+
+      let key = e.key.toUpperCase();
+      if (key === " ") key = "SPACE";
+      if (key === "ARROWUP") key = "UP";
+      if (key === "ARROWDOWN") key = "DOWN";
+      if (key === "ARROWLEFT") key = "LEFT";
+      if (key === "ARROWRIGHT") key = "RIGHT";
+      
+      parts.push(key);
+      const newShortcut = parts.join("+");
+      const action = input.getAttribute("data-action");
+      if (action) {
+        prefs.shortcuts[action] = newShortcut;
+        savePrefs();
+        syncPrefControls();
+        input.blur();
+        
+        // Update menu shortcuts display
+        updateMenuShortcuts();
+        // Update Monaco keybindings if editor exists
+        if (editor) {
+          // Re-create the editor's keybindings by clearing and re-setting
+          // In Monaco, addCommand doesn't have an easy "remove", but we can
+          // re-apply setupKeybindings which will add new commands.
+          // Note: Duplicate commands for the same key might exist, but Monaco 
+          // usually takes the last one or we might need a better way.
+          // For now, re-applying should work for the new shortcut.
+          setupKeybindings(editor);
+        }
+      }
+    });
+  });
+}
+
+function updateMenuShortcuts() {
+  const update = (id: string, action: string) => {
+    const el = document.querySelector(id + " .menu-shortcut");
+    if (el) el.textContent = prefs.shortcuts[action] || "";
+  };
+  update("#open-btn", "open-file");
+  update("#save-btn", "save-file");
+  update("#save-as-btn", "save-as");
+  update("#goto-btn", "goto");
+  update("#undo-btn", "undo");
+  update("#redo-btn", "redo");
+}
+
+function parseShortcut(shortcut: string) {
+  const parts = shortcut.split("+");
+  const key = parts.pop() || "";
+  return {
+    ctrl: parts.includes("Ctrl"),
+    shift: parts.includes("Shift"),
+    alt: parts.includes("Alt"),
+    meta: parts.includes("Meta"),
+    key: key.toLowerCase(),
+  };
+}
+
+function matchesShortcut(e: KeyboardEvent, action: string) {
+  const s = prefs.shortcuts[action];
+  if (!s) return false;
+  const p = parseShortcut(s);
+  
+  // Normalize key names for comparison
+  let eventKey = e.key.toLowerCase();
+  if (eventKey === " ") eventKey = "space";
+  if (eventKey === "arrowup") eventKey = "up";
+  if (eventKey === "arrowdown") eventKey = "down";
+  if (eventKey === "arrowleft") eventKey = "left";
+  if (eventKey === "arrowright") eventKey = "right";
+
+  return (
+    e.ctrlKey === p.ctrl &&
+    e.shiftKey === p.shift &&
+    e.altKey === p.alt &&
+    (e.metaKey || false) === p.meta &&
+    eventKey === p.key
+  );
 }
 
 function initApp() {
   const container = document.querySelector<HTMLDivElement>("#editor-container");
   if (!container) return;
 
-  const actionsMenu = document.querySelector<HTMLDetailsElement>("#actions-menu");
+  const menuBtn = document.querySelector<HTMLButtonElement>("#menu-btn");
+  const actionsPopover = document.querySelector<HTMLDivElement>("#actions-popover");
 
   const closeActionsMenu = () => {
-    if (actionsMenu) actionsMenu.open = false;
+    if (actionsPopover) actionsPopover.classList.add("hidden");
+  };
+
+  const toggleActionsMenu = (e: MouseEvent) => {
+    e.stopPropagation();
+    actionsPopover?.classList.toggle("hidden");
   };
 
   const chooseFile = () => {
@@ -1128,73 +1546,72 @@ function initApp() {
     openPreferencesDialog();
   };
 
+  document.querySelector("#menu-btn")?.addEventListener("click", (e) => toggleActionsMenu(e as MouseEvent));
   document.querySelector("#open-btn")?.addEventListener("click", chooseFile);
+  document.querySelector("#close-btn")?.addEventListener("click", closeFile);
+  document.querySelector("#welcome-open-btn")?.addEventListener("click", chooseFile);
+  document.querySelector("#new-tab-btn")?.addEventListener("click", () => void newTab());
   document.querySelector("#prefs-btn")?.addEventListener("click", openPreferences);
   wirePreferences();
   wireGotoDialog();
   wireExternalChangeDialog();
 
   window.addEventListener("click", (event) => {
-    if (actionsMenu?.open && !actionsMenu.contains(event.target as Node)) {
-      actionsMenu.open = false;
+    if (!actionsPopover?.classList.contains("hidden") && !actionsPopover?.contains(event.target as Node) && event.target !== menuBtn) {
+      actionsPopover?.classList.add("hidden");
     }
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && actionsMenu?.open) {
-      actionsMenu.open = false;
+    if (event.key === "Escape" && !actionsPopover?.classList.contains("hidden")) {
+      actionsPopover?.classList.add("hidden");
+    }
+    if (matchesShortcut(event, "new-tab")) {
+      event.preventDefault();
+      void newTab();
+    }
+    if (matchesShortcut(event, "close-tab") && currentPath) {
+      event.preventDefault();
+      void closeTab(currentTabId);
+    }
+    if (matchesShortcut(event, "open-file")) {
+      event.preventDefault();
+      chooseFile();
+    }
+    if (matchesShortcut(event, "save-file")) {
+      event.preventDefault();
+      void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
+    }
+    if (matchesShortcut(event, "save-as")) {
+      event.preventDefault();
+      void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
+    }
+    if (matchesShortcut(event, "goto")) {
+      event.preventDefault();
+      goToPosition();
+    }
+    if (matchesShortcut(event, "find")) {
+      event.preventDefault();
+      focusSearch();
+    }
+    if (matchesShortcut(event, "replace")) {
+      event.preventDefault();
+      focusReplace();
     }
   });
 
   loadPrefs();
+  updateMenuShortcuts();
 
-  editor = monaco.editor.create(container, {
-    value: "",
-    language: "plaintext",
-    automaticLayout: true,
-    scrollBeyondLastLine: false,
-    scrollbar: { vertical: "hidden", verticalScrollbarSize: 0 },
-    // Everything loads as plaintext, so Monaco's "tokenization skipped on long lines" and
-    // "rendering paused" hovers warn about work this app never does.
-    hover: { showLongLineWarning: false },
-    maxTokenizationLineLength: 10000,
-  });
-
+  // Defer editor creation until a file is opened.
   // Captured before any preference is applied, so "default" font can be restored later.
-  defaultFontFamily = editor.getOption(monaco.editor.EditorOption.fontFamily);
+  // We'll get this from a temporary dummy editor if needed, or just hardcode a common default.
+  defaultFontFamily = "Menlo, Monaco, 'Courier New', monospace";
   applyPrefs();
   syncPrefControls();
 
-  editor.onDidScrollChange(() => {
-    if (syncing) return;
-    const r = visibleModelRange();
-    if (!r) return;
-    viewTop = toFileLine(r.start);
-    if (currentPath) {
-      const pos = editor?.getPosition();
-      writeLineCache(currentPath, {
-        line: viewTop,
-        column: pos ? pos.column : 1,
-      });
-    }
-    updateScrollbar();
-    void maybeReanchor();
-  });
-  editor.onDidLayoutChange(() => updateScrollbar());
-  editor.onDidChangeCursorPosition(({ position }) => {
-    if (!syncing) {
-      updatePosition(position.lineNumber, position.column);
-      if (currentPath) {
-        writeLineCache(currentPath, {
-          line: viewTop,
-          column: position.column,
-        });
-      }
-    }
-  });
-
-  wireEditEvents();
   wireScrollbar();
   updateDocumentState();
+  updateTabsUI();
   updateHistoryControls();
 
   document.querySelector("#save-btn")?.addEventListener("click", () => {
@@ -1219,57 +1636,140 @@ function initApp() {
   });
   document.querySelector("#undo-btn")?.addEventListener("click", () => {
     closeActionsMenu();
-    editor.focus();
-    const model = editor.getModel() as any;
+    editor?.focus();
+    const model = editor?.getModel() as any;
     if (typeof model?.undo === "function") {
       model.undo();
-    } else {
+    } else if (editor) {
       editor.trigger("ui", "undo", null);
     }
     updateHistoryControls();
   });
   document.querySelector("#redo-btn")?.addEventListener("click", () => {
     closeActionsMenu();
-    editor.focus();
-    const model = editor.getModel() as any;
+    editor?.focus();
+    const model = editor?.getModel() as any;
     if (typeof model?.redo === "function") {
       model.redo();
-    } else {
+    } else if (editor) {
       editor.trigger("ui", "redo", null);
     }
     updateHistoryControls();
   });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+  const focusSearch = () => {
+    if (!editor) return;
+    searchInput?.focus();
+    searchInput?.select();
+  };
+  const focusReplace = () => {
+    if (!editor) return;
+    replaceInput?.focus();
+    replaceInput?.select();
+  };
+  const noop = () => {};
+
+function shortcutToMonacoKey(shortcut: string): number {
+  const parts = shortcut.split("+");
+  const keyStr = parts.pop() || "";
+  let key = 0;
+  
+  // Basic mapping for common keys
+  const keyMap: Record<string, number> = {
+    "A": monaco.KeyCode.KeyA, "B": monaco.KeyCode.KeyB, "C": monaco.KeyCode.KeyC,
+    "D": monaco.KeyCode.KeyD, "E": monaco.KeyCode.KeyE, "F": monaco.KeyCode.KeyF,
+    "G": monaco.KeyCode.KeyG, "H": monaco.KeyCode.KeyH, "I": monaco.KeyCode.KeyI,
+    "J": monaco.KeyCode.KeyJ, "K": monaco.KeyCode.KeyK, "L": monaco.KeyCode.KeyL,
+    "M": monaco.KeyCode.KeyM, "N": monaco.KeyCode.KeyN, "O": monaco.KeyCode.KeyO,
+    "P": monaco.KeyCode.KeyP, "Q": monaco.KeyCode.KeyQ, "R": monaco.KeyCode.KeyR,
+    "S": monaco.KeyCode.KeyS, "T": monaco.KeyCode.KeyT, "U": monaco.KeyCode.KeyU,
+    "V": monaco.KeyCode.KeyV, "W": monaco.KeyCode.KeyW, "X": monaco.KeyCode.KeyX,
+    "Y": monaco.KeyCode.KeyY, "Z": monaco.KeyCode.KeyZ,
+    "0": monaco.KeyCode.Digit0, "1": monaco.KeyCode.Digit1, "2": monaco.KeyCode.Digit2,
+    "3": monaco.KeyCode.Digit3, "4": monaco.KeyCode.Digit4, "5": monaco.KeyCode.Digit5,
+    "6": monaco.KeyCode.Digit6, "7": monaco.KeyCode.Digit7, "8": monaco.KeyCode.Digit8,
+    "9": monaco.KeyCode.Digit9,
+    "F1": monaco.KeyCode.F1, "F2": monaco.KeyCode.F2, "F3": monaco.KeyCode.F3,
+    "F4": monaco.KeyCode.F4, "F5": monaco.KeyCode.F5, "F6": monaco.KeyCode.F6,
+    "F7": monaco.KeyCode.F7, "F8": monaco.KeyCode.F8, "F9": monaco.KeyCode.F9,
+    "F10": monaco.KeyCode.F10, "F11": monaco.KeyCode.F11, "F12": monaco.KeyCode.F12,
+    "UP": monaco.KeyCode.UpArrow, "DOWN": monaco.KeyCode.DownArrow,
+    "LEFT": monaco.KeyCode.LeftArrow, "RIGHT": monaco.KeyCode.RightArrow,
+    "ENTER": monaco.KeyCode.Enter, "ESCAPE": monaco.KeyCode.Escape,
+    "SPACE": monaco.KeyCode.Space, "TAB": monaco.KeyCode.Tab,
+    "BACKSPACE": monaco.KeyCode.Backspace, "DELETE": monaco.KeyCode.Delete,
+    "INSERT": monaco.KeyCode.Insert, "HOME": monaco.KeyCode.Home,
+    "END": monaco.KeyCode.End, "PAGEUP": monaco.KeyCode.PageUp,
+    "PAGEDOWN": monaco.KeyCode.PageDown,
+  };
+
+  key = keyMap[keyStr] || 0;
+
+  let mod = 0;
+  if (parts.includes("Ctrl")) mod |= monaco.KeyMod.CtrlCmd;
+  if (parts.includes("Shift")) mod |= monaco.KeyMod.Shift;
+  if (parts.includes("Alt")) mod |= monaco.KeyMod.Alt;
+  if (parts.includes("Meta")) mod |= monaco.KeyMod.WinCtrl;
+
+  return mod | key;
+}
+
+let setupKeybindings: (ed: monaco.editor.IStandaloneCodeEditor) => void = () => {};
+setupKeybindings = (ed: monaco.editor.IStandaloneCodeEditor) => {
+  const add = (action: string, handler: () => void) => {
+    const k = prefs.shortcuts[action];
+    if (k) ed.addCommand(shortcutToMonacoKey(k), handler);
+  };
+
+  add("save-file", () => {
     void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
   });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, chooseFile);
-  editor.addCommand(
-    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS,
-    () => {
-      void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
-    }
-  );
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyG, () => {
+  add("open-file", chooseFile);
+  add("save-as", () => {
+    void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
+  });
+  add("goto", () => {
     goToPosition();
   });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => {
-    const model = editor.getModel() as any;
+  add("undo", () => {
+    const model = ed.getModel() as any;
     if (typeof model?.undo === "function") {
       model.undo();
     } else {
-      editor.trigger("ui", "undo", null);
+      ed.trigger("ui", "undo", null);
     }
     updateHistoryControls();
   });
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => {
-    const model = editor.getModel() as any;
+  add("redo", () => {
+    const model = ed.getModel() as any;
     if (typeof model?.redo === "function") {
       model.redo();
     } else {
-      editor.trigger("ui", "redo", null);
+      ed.trigger("ui", "redo", null);
     }
     updateHistoryControls();
   });
+
+  add("find", focusSearch);
+  add("replace", focusReplace);
+  add("new-tab", () => {
+    void newTab();
+  });
+  add("close-tab", () => {
+    void closeTab(currentTabId);
+  });
+  
+  // Fixed keybindings that aren't editable yet but we want to keep
+  ed.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
+  ed.addCommand(
+    monaco.KeyMod.Shift | monaco.KeyCode.F3,
+    () => void gotoHit(hitIndex - 1)
+  );
+  ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.F3, noop);
+  ed.addCommand(
+    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.F3,
+    noop
+  );
+};
 
   void listen<{ bytes_scanned: number; total_bytes: number }>(
     "scan-progress",
@@ -1296,7 +1796,7 @@ function initApp() {
     hits = hits.filter(
       (hit, index, all) => index === 0 || hit.byte_offset !== all[index - 1].byte_offset
     );
-    hitsTruncated = hits.length >= 5000;
+    hitsTruncated = hits.length >= 200000;
     updateSearchDecorations();
     updateHitControls();
     if (streamedNavigationRequestId !== activeSearchRequestId && hits.length > 0) {
@@ -1323,29 +1823,15 @@ function initApp() {
     void runSearch(query).catch((err) => setStatus(`Search failed: ${err}`));
   };
 
-  // Monaco has no option to disable its find widget, and it would only ever search the loaded
-  // window, so its keybindings are captured and routed to the file-wide search instead.
-  const focusSearch = () => {
-    searchInput?.focus();
-    searchInput?.select();
+  // Intercept anchorWindow to setup keybindings on first creation
+  const originalAnchorWindow = anchorWindow;
+  anchorWindow = async (start: number) => {
+    const isFirstTime = !editor;
+    await originalAnchorWindow(start);
+    if (isFirstTime && editor) {
+      setupKeybindings(editor);
+    }
   };
-  const focusReplace = () => {
-    replaceInput?.focus();
-    replaceInput?.select();
-  };
-  const noop = () => {};
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, focusSearch);
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusReplace);
-  editor.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
-  editor.addCommand(
-    monaco.KeyMod.Shift | monaco.KeyCode.F3,
-    () => void gotoHit(hitIndex - 1)
-  );
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.F3, noop);
-  editor.addCommand(
-    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.F3,
-    noop
-  );
 
   document.querySelector("#search-btn")?.addEventListener("click", () => {
     const query = searchInput?.value ?? "";
@@ -1368,6 +1854,12 @@ function initApp() {
       e.preventDefault();
       recordHistoryEntry(REPLACE_HISTORY_KEY, replaceInput.value);
       void replaceCurrentMatch().catch((err) => setStatus(`Replace failed: ${err}`));
+    }
+  });
+
+  searchInput?.addEventListener("input", () => {
+    if (!searchInput.value) {
+      void runSearch("");
     }
   });
 

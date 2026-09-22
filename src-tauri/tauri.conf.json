@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "giant-file-editor",
+  "productName": "MLog Text Editor",
   "version": "0.1.0",
-  "identifier": "com.giantfile.editor",
+  "identifier": "com.mlog.editor",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "giant-file-editor",
+        "title": "MLog Text Editor",
         "width": 800,
         "height": 600
       }
