@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tauri::{Emitter, State};
 
@@ -578,7 +578,9 @@ fn boyer_moore_horspool(haystack: &[u8], pattern: &[u8], fold_case: bool) -> Vec
 ///     straddle it, which is the only way a match can span the original buffer and an edit.
 #[allow(dead_code)]
 fn search_document(table: &PieceTable, pattern: &[u8], fold_case: bool) -> Vec<usize> {
-    search_document_with_progress(table, pattern, fold_case, false, None, None, 0).unwrap_or_default()
+    search_document_with_progress(table, pattern, fold_case, false, None, None, 0)
+        .map(|(hits, _)| hits)
+        .unwrap_or_default()
 }
 
 fn is_word_byte(byte: u8) -> bool {
@@ -608,8 +610,9 @@ fn search_regex_document(
     whole_word: bool,
     active_search_id: Option<&AtomicU64>,
     request_id: u64,
-) -> Result<Vec<(usize, usize)>, String> {
+) -> Result<(Vec<(usize, usize)>, usize), String> {
     let mut matches = Vec::new();
+    let mut total_matches = 0;
     for (piece_index, piece) in table.pieces.iter().enumerate() {
         let base = table.cum_bytes[piece_index];
         if let Source::Original = piece.source {
@@ -626,7 +629,10 @@ fn search_regex_document(
                     let offset = base + s + found.start();
                     let length = found.end().saturating_sub(found.start());
                     if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
-                        matches.push((offset, length));
+                        total_matches += 1;
+                        if matches.len() < MAX_REPORTED_HITS {
+                            matches.push((offset, length));
+                        }
                     }
                 }
                 
@@ -640,14 +646,17 @@ fn search_regex_document(
                 let offset = base + found.start();
                 let length = found.end().saturating_sub(found.start());
                 if length > 0 && (!whole_word || is_whole_word_match(table, offset, length)) {
-                    matches.push((offset, length));
+                    total_matches += 1;
+                    if matches.len() < MAX_REPORTED_HITS {
+                        matches.push((offset, length));
+                    }
                 }
             }
         }
     }
     matches.sort_unstable_by_key(|&(offset, _)| offset);
     matches.dedup_by_key(|(offset, _)| *offset);
-    Ok(matches)
+    Ok((matches, total_matches))
 }
 
 fn search_document_with_progress(
@@ -658,10 +667,10 @@ fn search_document_with_progress(
     app: Option<&tauri::AppHandle>,
     active_search_id: Option<&AtomicU64>,
     request_id: u64,
-) -> Result<Vec<usize>, String> {
+) -> Result<(Vec<usize>, usize), String> {
     let m = pattern.len();
     if m == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let overlap = m - 1;
 
@@ -677,7 +686,7 @@ fn search_document_with_progress(
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let total_bytes = table.total_length();
 
-    let mut hits: Vec<usize> = tasks
+    let hits: Vec<usize> = tasks
         .par_iter()
         .flat_map(|&(i, s)| {
             if cancelled.load(Ordering::Relaxed) {
@@ -702,8 +711,11 @@ fn search_document_with_progress(
                     !whole_word || is_whole_word_match(table, offset, pattern.len())
                 })
                 .collect::<Vec<_>>();
-            let streamed_hits = local_hits
-                .iter()
+            
+            let current_matches = matches_found.fetch_add(local_hits.len(), Ordering::Relaxed);
+            let streamed_hits = if current_matches < MAX_REPORTED_HITS {
+                let limit = (MAX_REPORTED_HITS - current_matches).min(local_hits.len());
+                local_hits[..limit].iter()
                 .map(|&byte_offset| {
                     let (line, column) = table.position_of_offset(byte_offset);
                     let (end_line, end_column) =
@@ -716,9 +728,12 @@ fn search_document_with_progress(
                         end_column,
                     }
                 })
-                .collect();
+                .collect()
+            } else {
+                Vec::new()
+            };
             bytes_scanned.fetch_add(primary_end - s, Ordering::Relaxed);
-            matches_found.fetch_add(local_hits.len(), Ordering::Relaxed);
+            
             if let Some(app) = app {
                 let _ = app.emit(
                     "search-progress",
@@ -736,7 +751,13 @@ fn search_document_with_progress(
             if let Source::Original = p.source {
                 release_memory(&bytes[s..scan_end]);
             }
-            local_hits
+            
+            if current_matches < MAX_REPORTED_HITS {
+                let limit = (MAX_REPORTED_HITS - current_matches).min(local_hits.len());
+                local_hits[..limit].to_vec()
+            } else {
+                Vec::new()
+            }
         })
         .collect();
 
@@ -763,8 +784,11 @@ fn search_document_with_progress(
             let window = table.get_bytes_range(lo, hi);
             boyer_moore_horspool(&window, pattern, fold_case)
                 .into_iter()
+                .filter(move |&local| {
+                    let abs = lo + local;
+                    abs < b && abs + m > b
+                })
                 .map(move |local| lo + local)
-                .filter(move |&abs| abs < b && abs + m > b)
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -773,9 +797,13 @@ fn search_document_with_progress(
         return Err("search cancelled".to_string());
     }
 
-    hits.extend(boundary_hits);
-    hits.sort_unstable();
-    hits.dedup(); // a match spanning several tiny pieces is found at each boundary it crosses
+    let mut all_hits = hits;
+    all_hits.extend(boundary_hits.iter().cloned());
+    all_hits.sort_unstable();
+    all_hits.dedup(); 
+    
+    let final_total = matches_found.load(Ordering::Relaxed) + boundary_hits.len(); // Approximate if many boundary hits, but good enough
+
     if let Some(app) = app {
         let _ = app.emit(
             "search-progress",
@@ -783,12 +811,12 @@ fn search_document_with_progress(
                 request_id,
                 bytes_scanned: total_bytes,
                 total_bytes,
-                matches_found: hits.len(),
+                matches_found: final_total,
                 hits: Vec::new(),
             },
         );
     }
-    Ok(hits)
+    Ok((all_hits, final_total))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -797,7 +825,7 @@ fn search_document_with_progress(
 
 /// Matches returned to the UI are capped: a search for "e" in an 8 GB file has billions of
 /// hits, and serializing them over IPC would defeat the whole point of streaming the file.
-const MAX_REPORTED_HITS: usize = 5_000;
+const MAX_REPORTED_HITS: usize = 200_000;
 
 fn empty_piece_table() -> PieceTable {
     let mmap = MmapOptions::new().len(0).map_anon().unwrap();
@@ -814,7 +842,7 @@ struct DocumentState {
 }
 
 struct AppState {
-    documents: Arc<Mutex<HashMap<String, DocumentState>>>,
+    documents: Arc<RwLock<HashMap<String, DocumentState>>>,
     active_id: Arc<Mutex<String>>,
     active_search_id: Arc<AtomicU64>,
 }
@@ -829,7 +857,7 @@ impl Default for AppState {
             last_modified_ms: 0,
         });
         Self {
-            documents: Arc::new(Mutex::new(documents)),
+            documents: Arc::new(RwLock::new(documents)),
             active_id: Arc::new(Mutex::new(initial_id)),
             active_search_id: Arc::new(AtomicU64::new(0)),
         }
@@ -885,7 +913,23 @@ struct SearchProgress {
 
 /// Runs `f` against the open document on a blocking thread so neither the mmap page faults nor
 /// the index work ever land on the UI thread.
-async fn with_table<T, F>(state: &State<'_, AppState>, f: F) -> Result<T, String>
+async fn with_table_read<T, F>(state: &State<'_, AppState>, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&PieceTable) -> T + Send + 'static,
+{
+    let documents = state.documents.clone();
+    let active_id = state.active_id.lock().unwrap().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = documents.read().map_err(|e| e.to_string())?;
+        let doc = guard.get(&active_id).ok_or("no active document")?;
+        Ok(f(&doc.table))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn with_table_write<T, F>(state: &State<'_, AppState>, f: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&mut PieceTable) -> T + Send + 'static,
@@ -893,7 +937,7 @@ where
     let documents = state.documents.clone();
     let active_id = state.active_id.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = documents.lock().map_err(|e| e.to_string())?;
+            let mut guard = documents.write().map_err(|e| e.to_string())?;
         let doc = guard.get_mut(&active_id).ok_or("no active document")?;
         Ok(f(&mut doc.table))
     })
@@ -994,7 +1038,7 @@ async fn open_file(
     };
     
     let active_id = state.active_id.lock().unwrap().clone();
-    let mut docs = state.documents.lock().map_err(|e| e.to_string())?;
+    let mut docs = state.documents.write().map_err(|e| e.to_string())?;
     let doc = docs.get_mut(&active_id).ok_or("no active document")?;
     doc.table = table;
     doc.path = Some(PathBuf::from(open_path));
@@ -1013,7 +1057,7 @@ async fn save_file(
     let target = match path {
         Some(path) => PathBuf::from(path),
         None => {
-            let docs = state.documents.lock().unwrap();
+            let docs = state.documents.write().unwrap();
             let doc = docs.get(&active_id).ok_or("no active document")?;
             doc.path.clone().ok_or("no file path selected")?
         }
@@ -1024,8 +1068,8 @@ async fn save_file(
         let target = target.clone();
         let active_id = active_id.clone();
         move || {
-            let mut guard = documents.lock().map_err(|e| e.to_string())?;
-            let doc = guard.get_mut(&active_id).ok_or("no active document")?;
+            let guard = documents.read().map_err(|e| e.to_string())?;
+            let doc = guard.get(&active_id).ok_or("no active document")?;
             let table = &doc.table;
             let mut temporary = target.clone();
             temporary.set_extension(format!("gfe-tmp-{}", std::process::id()));
@@ -1057,7 +1101,7 @@ async fn save_file(
     .await
     .map_err(|e| e.to_string())??;
 
-    let mut guard = state.documents.lock().unwrap();
+    let mut guard = state.documents.write().unwrap();
     let doc = guard.get_mut(&active_id).unwrap();
     doc.path = Some(target.clone());
     doc.last_modified_ms = get_file_mtime_ms(&target.to_string_lossy());
@@ -1068,7 +1112,7 @@ async fn save_file(
 #[tauri::command]
 async fn check_file_changed(state: State<'_, AppState>) -> Result<bool, String> {
     let active_id = state.active_id.lock().unwrap().clone();
-    let docs = state.documents.lock().unwrap();
+    let docs = state.documents.write().unwrap();
     let doc = docs.get(&active_id).ok_or("no active document")?;
     
     let path = match &doc.path {
@@ -1091,7 +1135,7 @@ async fn get_lines(
     start_line: usize,
     end_line: usize,
 ) -> Result<String, String> {
-    with_table(&state, move |table| {
+    with_table_read(&state, move |table| {
         table.get_lines(start_line.saturating_sub(1), end_line)
     })
     .await
@@ -1106,7 +1150,7 @@ async fn insert_text(
     column: usize,
     text: String,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let offset = table.offset_of_position(line, column);
         table.insert_text(offset, &text);
         table.total_lines()
@@ -1123,7 +1167,7 @@ async fn delete_text(
     end_line: usize,
     end_column: usize,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let start = table.offset_of_position(start_line, start_column);
         let end = table.offset_of_position(end_line, end_column);
         table.delete_text(start, end.saturating_sub(start));
@@ -1139,7 +1183,7 @@ async fn byte_offset(
     line: usize,
     column: usize,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| table.offset_of_position(line, column))
+    with_table_read(&state, move |table| table.offset_of_position(line, column))
         .await
 }
 
@@ -1148,7 +1192,7 @@ async fn position_at_byte(
     state: State<'_, AppState>,
     offset: usize,
 ) -> Result<(usize, usize), String> {
-    with_table(&state, move |table| table.position_of_offset(offset.min(table.total_length())))
+    with_table_read(&state, move |table| table.position_of_offset(offset.min(table.total_length())))
         .await
 }
 
@@ -1177,8 +1221,8 @@ async fn search_text(
         None
     };
     let active_search_id = state.active_search_id.clone();
-    with_table(&state, move |table| {
-        let matches = if regex {
+    with_table_read(&state, move |table| {
+        let (matches, total_matches) = if regex {
             search_regex_document(
                 table,
                 regex_engine.as_ref().expect("regex engine is present"),
@@ -1192,7 +1236,7 @@ async fn search_text(
             } else {
                 fold_bytes(query.as_bytes())
             };
-            let hits = search_document_with_progress(
+            let (hits, total) = search_document_with_progress(
                 table,
                 &pattern,
                 !match_case,
@@ -1201,11 +1245,11 @@ async fn search_text(
                 Some(&active_search_id),
                 request_id,
             )?;
-            hits.into_iter()
+            let mapped_hits = hits.into_iter()
                 .map(|offset| (offset, pattern.len()))
-                .collect()
+                .collect();
+            (mapped_hits, total)
         };
-        let total_matches = matches.len();
         let hits = matches
             .iter()
             .take(MAX_REPORTED_HITS)
@@ -1238,7 +1282,7 @@ fn cancel_search(state: State<'_, AppState>) {
 
 #[tauri::command]
 fn switch_document(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let docs = state.documents.lock().map_err(|e| e.to_string())?;
+    let docs = state.documents.write().map_err(|e| e.to_string())?;
     if !docs.contains_key(&id) {
         return Err("document not found".to_string());
     }
@@ -1249,7 +1293,7 @@ fn switch_document(state: State<'_, AppState>, id: String) -> Result<(), String>
 
 #[tauri::command]
 fn new_document(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let mut docs = state.documents.lock().map_err(|e| e.to_string())?;
+    let mut docs = state.documents.write().map_err(|e| e.to_string())?;
     docs.insert(id.clone(), DocumentState {
         table: empty_piece_table(),
         path: None,
@@ -1262,7 +1306,7 @@ fn new_document(state: State<'_, AppState>, id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn close_tab(state: State<'_, AppState>, id: String) -> Result<String, String> {
-    let mut docs = state.documents.lock().map_err(|e| e.to_string())?;
+    let mut docs = state.documents.write().map_err(|e| e.to_string())?;
     if docs.len() <= 1 {
         // Can't close the last tab, just reset it
         let doc = docs.values_mut().next().unwrap();
@@ -1291,7 +1335,7 @@ async fn replace_match(
     end_column: usize,
     text: String,
 ) -> Result<usize, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let start = table.offset_of_position(start_line, start_column);
         let end = table.offset_of_position(end_line, end_column);
         let len = end.saturating_sub(start);
@@ -1331,22 +1375,23 @@ async fn replace_all(
         None
     };
 
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let matches: Vec<(usize, usize)> = if regex {
-            search_regex_document(
+            let (hits, _) = search_regex_document(
                 table,
                 regex_engine.as_ref().expect("regex engine is present"),
                 whole_word,
                 None,
                 0,
-            )?
+            )?;
+            hits
         } else {
             let pattern = if match_case {
                 query.as_bytes().to_vec()
             } else {
                 fold_bytes(query.as_bytes())
             };
-            let hits = search_document_with_progress(
+            let (hits, _) = search_document_with_progress(
                 table,
                 &pattern,
                 !match_case,
@@ -1385,7 +1430,7 @@ async fn convert_line_endings(
     state: State<'_, AppState>,
     target_format: String,
 ) -> Result<FileMeta, String> {
-    with_table(&state, move |table| {
+    with_table_write(&state, move |table| {
         let total = table.total_length();
         let bytes = table.get_bytes_range(0, total);
         let mut text = String::from_utf8_lossy(&bytes).into_owned();

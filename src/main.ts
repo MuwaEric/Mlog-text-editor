@@ -8,6 +8,7 @@ import editorWorker from "monaco-editor/editor/editor.worker.js?worker";
 self.MonacoEnvironment = { getWorker: () => new editorWorker() };
 
 // Monaco's model holds a bounded WINDOW of the file, never the whole thing. Giving it the real
+let setupKeybindings: (ed: monaco.editor.IStandaloneCodeEditor) => void = () => {};
 // line count is fatal twice over: the model allocates per-line state for every line, and the
 // compositor allocates tile memory for a scroll layer lineCount * lineHeight pixels tall (1M
 // lines is ~19 million pixels, which exhausted RAM as soon as the user scrolled).
@@ -1016,6 +1017,7 @@ async function runSearch(query: string) {
     lastQuery = "";
     setStatus("");
     void invoke("cancel_search");
+    updateSearchMarkers();
     return;
   }
 
@@ -1049,8 +1051,28 @@ async function runSearch(query: string) {
   lastRegex = regex;
   updateSearchDecorations();
   updateHitControls();
+  updateSearchMarkers();
 
   if (hits.length > 0) await gotoHit(0);
+}
+
+
+function updateSearchMarkers() {
+  const track = document.querySelector<HTMLElement>("#vscroll");
+  if (!track) return;
+  track.querySelectorAll(".search-marker").forEach((el) => el.remove());
+  if (hits.length === 0 || hits.length > 5000) return;
+  const trackH = track.clientHeight;
+  const fragment = document.createDocumentFragment();
+  for (let i = 0; i < hits.length; i++) {
+    const hit = hits[i];
+    const pos = (hit.line - 1) / Math.max(1, totalLines - 1);
+    const marker = document.createElement("div");
+    marker.className = "search-marker";
+    marker.style.top = `${Math.round(pos * trackH)}px`;
+    fragment.appendChild(marker);
+  }
+  track.appendChild(fragment);
 }
 
 function updateHitControls() {
@@ -1165,6 +1187,7 @@ async function replaceAllMatches() {
     setStatus("Enter search text to replace all", false);
     return;
   }
+  const replaceInput = document.querySelector<HTMLInputElement>("#replace-input");
   const replacement = replaceInput?.value ?? "";
 
   const matchCase =
@@ -1690,7 +1713,8 @@ function shortcutToMonacoKey(shortcut: string): number {
   return mod | key;
 }
 
-const setupKeybindings = (ed: monaco.editor.IStandaloneCodeEditor) => {
+let setupKeybindings: (ed: monaco.editor.IStandaloneCodeEditor) => void = () => {};
+setupKeybindings = (ed: monaco.editor.IStandaloneCodeEditor) => {
   const add = (action: string, handler: () => void) => {
     const k = prefs.shortcuts[action];
     if (k) ed.addCommand(shortcutToMonacoKey(k), handler);
@@ -1772,7 +1796,7 @@ const setupKeybindings = (ed: monaco.editor.IStandaloneCodeEditor) => {
     hits = hits.filter(
       (hit, index, all) => index === 0 || hit.byte_offset !== all[index - 1].byte_offset
     );
-    hitsTruncated = hits.length >= 5000;
+    hitsTruncated = hits.length >= 200000;
     updateSearchDecorations();
     updateHitControls();
     if (streamedNavigationRequestId !== activeSearchRequestId && hits.length > 0) {
