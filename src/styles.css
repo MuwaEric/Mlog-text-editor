@@ -547,6 +547,36 @@ body {
   word-break: break-all;
 }
 
+.shortcut-input {
+  width: 10em !important;
+  text-align: center;
+  cursor: pointer;
+  caret-color: transparent;
+  background: #353535;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  color: #eee;
+  padding: 0.2em 0.5em;
+}
+
+.shortcut-input:focus {
+  border-color: #007acc;
+  outline: none;
+  background: #404040;
+}
+
+.pref-row h3 {
+  margin: 0;
+  font-size: 1.1em;
+  color: #fff;
+}
+
+.metadata-section h3 {
+  margin: 0 0 0.5em 0;
+  font-size: 1.1em;
+  color: #fff;
+}
+
 .pref-row input[type="number"],
 .pref-row select {
   width: 8em;

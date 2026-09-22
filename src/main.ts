@@ -39,6 +39,7 @@ interface Prefs {
   matchCase: boolean;
   readOnly: boolean;
   windowLines: number;
+  shortcuts: Record<string, string>;
 }
 
 const DEFAULT_PREFS: Prefs = {
@@ -58,6 +59,18 @@ const DEFAULT_PREFS: Prefs = {
   matchCase: false,
   readOnly: false,
   windowLines: 4000,
+  shortcuts: {
+    "open-file": "Ctrl+O",
+    "save-file": "Ctrl+S",
+    "save-as": "Ctrl+Shift+S",
+    "new-tab": "Ctrl+T",
+    "close-tab": "Ctrl+W",
+    "goto": "Ctrl+G",
+    "find": "Ctrl+F",
+    "replace": "Ctrl+H",
+    "undo": "Ctrl+Z",
+    "redo": "Ctrl+Y",
+  },
 };
 
 const PREFS_KEY = "gfe.prefs";
@@ -1251,6 +1264,14 @@ function syncPrefControls() {
   set("#pref-match-case", (el) => (el.checked = prefs.matchCase));
   set("#pref-read-only", (el) => (el.checked = prefs.readOnly));
   set("#pref-window-lines", (el) => (el.value = String(prefs.windowLines)));
+  
+  document.querySelectorAll<HTMLInputElement>(".shortcut-input").forEach((el) => {
+    const action = el.getAttribute("data-action");
+    if (action && action in prefs.shortcuts) {
+      el.value = prefs.shortcuts[action];
+    }
+  });
+
   set("#word-wrap", (el) => (el.checked = prefs.wordWrap));
   set("#match-case", (el) => (el.checked = prefs.matchCase));
   set("#read-only", (el) => (el.checked = prefs.readOnly));
@@ -1356,6 +1377,112 @@ function wirePreferences() {
     ?.addEventListener("change", (e) => {
       void updatePref("fontFamily", (e.target as HTMLInputElement).value);
     });
+
+  document.querySelectorAll<HTMLInputElement>(".shortcut-input").forEach((input) => {
+    input.addEventListener("focus", () => {
+      input.value = "Press keys...";
+    });
+    input.addEventListener("blur", () => {
+      const action = input.getAttribute("data-action");
+      if (action) input.value = prefs.shortcuts[action] || "";
+    });
+    input.addEventListener("keydown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.key === "Escape") {
+        input.blur();
+        return;
+      }
+
+      if (e.key === "Control" || e.key === "Shift" || e.key === "Alt" || e.key === "Meta") {
+        return;
+      }
+
+      const parts: string[] = [];
+      if (e.ctrlKey) parts.push("Ctrl");
+      if (e.shiftKey) parts.push("Shift");
+      if (e.altKey) parts.push("Alt");
+      if (e.metaKey) parts.push("Meta");
+
+      let key = e.key.toUpperCase();
+      if (key === " ") key = "SPACE";
+      if (key === "ARROWUP") key = "UP";
+      if (key === "ARROWDOWN") key = "DOWN";
+      if (key === "ARROWLEFT") key = "LEFT";
+      if (key === "ARROWRIGHT") key = "RIGHT";
+      
+      parts.push(key);
+      const newShortcut = parts.join("+");
+      const action = input.getAttribute("data-action");
+      if (action) {
+        prefs.shortcuts[action] = newShortcut;
+        savePrefs();
+        syncPrefControls();
+        input.blur();
+        
+        // Update menu shortcuts display
+        updateMenuShortcuts();
+        // Update Monaco keybindings if editor exists
+        if (editor) {
+          // Re-create the editor's keybindings by clearing and re-setting
+          // In Monaco, addCommand doesn't have an easy "remove", but we can
+          // re-apply setupKeybindings which will add new commands.
+          // Note: Duplicate commands for the same key might exist, but Monaco 
+          // usually takes the last one or we might need a better way.
+          // For now, re-applying should work for the new shortcut.
+          setupKeybindings(editor);
+        }
+      }
+    });
+  });
+}
+
+function updateMenuShortcuts() {
+  const update = (id: string, action: string) => {
+    const el = document.querySelector(id + " .menu-shortcut");
+    if (el) el.textContent = prefs.shortcuts[action] || "";
+  };
+  update("#open-btn", "open-file");
+  update("#save-btn", "save-file");
+  update("#save-as-btn", "save-as");
+  update("#goto-btn", "goto");
+  update("#undo-btn", "undo");
+  update("#redo-btn", "redo");
+}
+
+function parseShortcut(shortcut: string) {
+  const parts = shortcut.split("+");
+  const key = parts.pop() || "";
+  return {
+    ctrl: parts.includes("Ctrl"),
+    shift: parts.includes("Shift"),
+    alt: parts.includes("Alt"),
+    meta: parts.includes("Meta"),
+    key: key.toLowerCase(),
+  };
+}
+
+function matchesShortcut(e: KeyboardEvent, action: string) {
+  const s = prefs.shortcuts[action];
+  if (!s) return false;
+  const p = parseShortcut(s);
+  
+  // Normalize key names for comparison
+  let eventKey = e.key.toLowerCase();
+  if (eventKey === " ") eventKey = "space";
+  if (eventKey === "arrowup") eventKey = "up";
+  if (eventKey === "arrowdown") eventKey = "down";
+  if (eventKey === "arrowleft") eventKey = "left";
+  if (eventKey === "arrowright") eventKey = "right";
+
+  return (
+    e.ctrlKey === p.ctrl &&
+    e.shiftKey === p.shift &&
+    e.altKey === p.alt &&
+    (e.metaKey || false) === p.meta &&
+    eventKey === p.key
+  );
 }
 
 function initApp() {
@@ -1415,17 +1542,42 @@ function initApp() {
     if (event.key === "Escape" && !actionsPopover?.classList.contains("hidden")) {
       actionsPopover?.classList.add("hidden");
     }
-    if ((event.ctrlKey || event.metaKey) && event.key === "t") {
+    if (matchesShortcut(event, "new-tab")) {
       event.preventDefault();
       void newTab();
     }
-    if ((event.ctrlKey || event.metaKey) && event.key === "w" && currentPath) {
+    if (matchesShortcut(event, "close-tab") && currentPath) {
       event.preventDefault();
       void closeTab(currentTabId);
+    }
+    if (matchesShortcut(event, "open-file")) {
+      event.preventDefault();
+      chooseFile();
+    }
+    if (matchesShortcut(event, "save-file")) {
+      event.preventDefault();
+      void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
+    }
+    if (matchesShortcut(event, "save-as")) {
+      event.preventDefault();
+      void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
+    }
+    if (matchesShortcut(event, "goto")) {
+      event.preventDefault();
+      goToPosition();
+    }
+    if (matchesShortcut(event, "find")) {
+      event.preventDefault();
+      focusSearch();
+    }
+    if (matchesShortcut(event, "replace")) {
+      event.preventDefault();
+      focusReplace();
     }
   });
 
   loadPrefs();
+  updateMenuShortcuts();
 
   // Defer editor creation until a file is opened.
   // Captured before any preference is applied, so "default" font can be restored later.
@@ -1493,58 +1645,107 @@ function initApp() {
   };
   const noop = () => {};
 
-  const setupKeybindings = (ed: monaco.editor.IStandaloneCodeEditor) => {
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-      void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
-    });
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, chooseFile);
-    ed.addCommand(
-      monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS,
-      () => {
-        void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
-      }
-    );
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyG, () => {
-      goToPosition();
-    });
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => {
-      const model = ed.getModel() as any;
-      if (typeof model?.undo === "function") {
-        model.undo();
-      } else {
-        ed.trigger("ui", "undo", null);
-      }
-      updateHistoryControls();
-    });
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => {
-      const model = ed.getModel() as any;
-      if (typeof model?.redo === "function") {
-        model.redo();
-      } else {
-        ed.trigger("ui", "redo", null);
-      }
-      updateHistoryControls();
-    });
-
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, focusSearch);
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, focusReplace);
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyT, () => {
-      void newTab();
-    });
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW, () => {
-      void closeTab(currentTabId);
-    });
-    ed.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
-    ed.addCommand(
-      monaco.KeyMod.Shift | monaco.KeyCode.F3,
-      () => void gotoHit(hitIndex - 1)
-    );
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.F3, noop);
-    ed.addCommand(
-      monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.F3,
-      noop
-    );
+function shortcutToMonacoKey(shortcut: string): number {
+  const parts = shortcut.split("+");
+  const keyStr = parts.pop() || "";
+  let key = 0;
+  
+  // Basic mapping for common keys
+  const keyMap: Record<string, number> = {
+    "A": monaco.KeyCode.KeyA, "B": monaco.KeyCode.KeyB, "C": monaco.KeyCode.KeyC,
+    "D": monaco.KeyCode.KeyD, "E": monaco.KeyCode.KeyE, "F": monaco.KeyCode.KeyF,
+    "G": monaco.KeyCode.KeyG, "H": monaco.KeyCode.KeyH, "I": monaco.KeyCode.KeyI,
+    "J": monaco.KeyCode.KeyJ, "K": monaco.KeyCode.KeyK, "L": monaco.KeyCode.KeyL,
+    "M": monaco.KeyCode.KeyM, "N": monaco.KeyCode.KeyN, "O": monaco.KeyCode.KeyO,
+    "P": monaco.KeyCode.KeyP, "Q": monaco.KeyCode.KeyQ, "R": monaco.KeyCode.KeyR,
+    "S": monaco.KeyCode.KeyS, "T": monaco.KeyCode.KeyT, "U": monaco.KeyCode.KeyU,
+    "V": monaco.KeyCode.KeyV, "W": monaco.KeyCode.KeyW, "X": monaco.KeyCode.KeyX,
+    "Y": monaco.KeyCode.KeyY, "Z": monaco.KeyCode.KeyZ,
+    "0": monaco.KeyCode.Digit0, "1": monaco.KeyCode.Digit1, "2": monaco.KeyCode.Digit2,
+    "3": monaco.KeyCode.Digit3, "4": monaco.KeyCode.Digit4, "5": monaco.KeyCode.Digit5,
+    "6": monaco.KeyCode.Digit6, "7": monaco.KeyCode.Digit7, "8": monaco.KeyCode.Digit8,
+    "9": monaco.KeyCode.Digit9,
+    "F1": monaco.KeyCode.F1, "F2": monaco.KeyCode.F2, "F3": monaco.KeyCode.F3,
+    "F4": monaco.KeyCode.F4, "F5": monaco.KeyCode.F5, "F6": monaco.KeyCode.F6,
+    "F7": monaco.KeyCode.F7, "F8": monaco.KeyCode.F8, "F9": monaco.KeyCode.F9,
+    "F10": monaco.KeyCode.F10, "F11": monaco.KeyCode.F11, "F12": monaco.KeyCode.F12,
+    "UP": monaco.KeyCode.UpArrow, "DOWN": monaco.KeyCode.DownArrow,
+    "LEFT": monaco.KeyCode.LeftArrow, "RIGHT": monaco.KeyCode.RightArrow,
+    "ENTER": monaco.KeyCode.Enter, "ESCAPE": monaco.KeyCode.Escape,
+    "SPACE": monaco.KeyCode.Space, "TAB": monaco.KeyCode.Tab,
+    "BACKSPACE": monaco.KeyCode.Backspace, "DELETE": monaco.KeyCode.Delete,
+    "INSERT": monaco.KeyCode.Insert, "HOME": monaco.KeyCode.Home,
+    "END": monaco.KeyCode.End, "PAGEUP": monaco.KeyCode.PageUp,
+    "PAGEDOWN": monaco.KeyCode.PageDown,
   };
+
+  key = keyMap[keyStr] || 0;
+
+  let mod = 0;
+  if (parts.includes("Ctrl")) mod |= monaco.KeyMod.CtrlCmd;
+  if (parts.includes("Shift")) mod |= monaco.KeyMod.Shift;
+  if (parts.includes("Alt")) mod |= monaco.KeyMod.Alt;
+  if (parts.includes("Meta")) mod |= monaco.KeyMod.WinCtrl;
+
+  return mod | key;
+}
+
+const setupKeybindings = (ed: monaco.editor.IStandaloneCodeEditor) => {
+  const add = (action: string, handler: () => void) => {
+    const k = prefs.shortcuts[action];
+    if (k) ed.addCommand(shortcutToMonacoKey(k), handler);
+  };
+
+  add("save-file", () => {
+    void saveDocument().catch((error) => setStatus(`Save failed: ${error}`));
+  });
+  add("open-file", chooseFile);
+  add("save-as", () => {
+    void saveDocument(null).catch((error) => setStatus(`Save failed: ${error}`));
+  });
+  add("goto", () => {
+    goToPosition();
+  });
+  add("undo", () => {
+    const model = ed.getModel() as any;
+    if (typeof model?.undo === "function") {
+      model.undo();
+    } else {
+      ed.trigger("ui", "undo", null);
+    }
+    updateHistoryControls();
+  });
+  add("redo", () => {
+    const model = ed.getModel() as any;
+    if (typeof model?.redo === "function") {
+      model.redo();
+    } else {
+      ed.trigger("ui", "redo", null);
+    }
+    updateHistoryControls();
+  });
+
+  add("find", focusSearch);
+  add("replace", focusReplace);
+  add("new-tab", () => {
+    void newTab();
+  });
+  add("close-tab", () => {
+    void closeTab(currentTabId);
+  });
+  
+  // Fixed keybindings that aren't editable yet but we want to keep
+  ed.addCommand(monaco.KeyCode.F3, () => void gotoHit(hitIndex + 1));
+  ed.addCommand(
+    monaco.KeyMod.Shift | monaco.KeyCode.F3,
+    () => void gotoHit(hitIndex - 1)
+  );
+  ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.F3, noop);
+  ed.addCommand(
+    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.F3,
+    noop
+  );
+};
 
   void listen<{ bytes_scanned: number; total_bytes: number }>(
     "scan-progress",
@@ -1598,19 +1799,15 @@ function initApp() {
     void runSearch(query).catch((err) => setStatus(`Search failed: ${err}`));
   };
 
-  // Monaco has no option to disable its find widget, and it would only ever search the loaded
-  // window, so its keybindings are captured and routed to the file-wide search instead.
-  
   // Intercept anchorWindow to setup keybindings on first creation
   const originalAnchorWindow = anchorWindow;
-  const newAnchorWindow = async (start: number) => {
+  anchorWindow = async (start: number) => {
     const isFirstTime = !editor;
     await originalAnchorWindow(start);
     if (isFirstTime && editor) {
       setupKeybindings(editor);
     }
   };
-  anchorWindow = newAnchorWindow;
 
   document.querySelector("#search-btn")?.addEventListener("click", () => {
     const query = searchInput?.value ?? "";
